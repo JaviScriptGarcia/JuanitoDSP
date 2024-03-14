@@ -23,12 +23,6 @@
 .settings/
 .vscode/
 
-# GeneralShit
-*.mxproject
-*.cproject
-*.project
-
-
 # Debug
 Debug/
 
@@ -56,10 +50,6 @@ Debug/
 *.mod*
 *.cmd
 .tmp_versions/
-
-
-*.launch
-*.ld
 
 modules.order
 Module.symvers
