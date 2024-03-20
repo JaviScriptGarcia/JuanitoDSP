@@ -37,7 +37,7 @@
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE 128 
 
-#define DMA_INT_PERIOD ((BUFFER_SIZE / 2) * 1000000 / SAMPLE_RATE) // us
+#define DMA_INT_PERIOD ((BUFFER_SIZE / 2) * 100000 / SAMPLE_RATE) // 10 x us
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -374,9 +374,9 @@ static void MX_TIM16_Init(void)
 
   /* USER CODE END TIM16_Init 1 */
   htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 5000-1;
+  htim16.Init.Prescaler = 124-1;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 1000;
+  htim16.Init.Period = 1;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim16.Init.RepetitionCounter = 0;
   htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -558,7 +558,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     // if (nFiltIIRLP > 2) nFiltIIRLP = 0;
     // count = 0;
     // }
-    // count++;
+    count++;
     // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14); 				// Toggle LED rojo
   }
   if(htim->Instance == TIM3)
@@ -713,7 +713,7 @@ static tErrorCode ProcessData(void)
       // Apply filters
       if (RES_OK != ApplyFilters(&bufL[0], &bufR[0], BUFFER_SIZE/2)) 
       {return RES_ERROR;}
-      
+
       // Encode output buffer with PCM
       if (RES_OK != EncodeBuffer(&dac_buf[0], &bufL[0], &bufR[0], 
                     BUFFER_SIZE/2)) return RES_ERROR;
@@ -738,6 +738,7 @@ static tErrorCode ProcessData(void)
         break;
   }
   
+  //while(timerCount < 1.01 * DMA_INT_PERIOD) ADD THIS BEFORE ENCODING TO FUCK
   cpuUsage = timerCount * 100 / DMA_INT_PERIOD;
   dataReadyFlag = 0;
   return RES_OK;
