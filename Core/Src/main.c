@@ -596,6 +596,29 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 }
 
 // *****************************************************************************
+static tErrorCode Uint24ToInt16(uint32_t *inBuf, uint16_t length)
+// *****************************************************************************
+// Description: Converts received samples from unsigned 24 bit to signed 16 bit
+// Parameters:
+//   inBuf: Pointer to the first input buffer position to be converted
+//   length: Number of array positions to convert 
+// Returns: error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf)) 
+  {return RES_ERROR_PARAM;}
+  
+  uint16_t i;
+  for (i = 0; i < length; i++)
+    {
+    	*inBuf++ = (*inBuf)>>8; 	  //Convert from 24 unsigned to 16 signed.
+    	*inBuf++ = (*inBuf)>>8; //Convert from 24 unsigned to 16 signed.
+    }
+
+    return RES_OK;
+}
+
+// *****************************************************************************
 static tErrorCode DecodeBuffer(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
                                uint16_t length)
 // *****************************************************************************
@@ -605,7 +628,7 @@ static tErrorCode DecodeBuffer(uint32_t *inBuf, int16_t *bufL, int16_t *bufR,
 //   bufL: Pointer to the buffer where the left channel should be written
 //   bufR: Pointer to the buffer where the right channel should be written
 //   length: Number of array positions to be decoded 
-// Returns: nothing
+// Returns: error code
 // *****************************************************************************
 {
   if ((NULL == inBuf) || (NULL == bufL) || (NULL == bufR)) 
@@ -614,11 +637,8 @@ static tErrorCode DecodeBuffer(uint32_t *inBuf, int16_t *bufL, int16_t *bufR,
   uint16_t i;
   for (i = 0; i < length; i++)
     {
-    	inBuf[2*i] = inBuf[2*i]>>8; 	  //Convert from 24 unsigned to 16 signed.
-    	inBuf[2*i+1] = inBuf[2*i+1]>>8; //Convert from 24 unsigned to 16 signed.
-        
-      bufL[i] = inBuf[2*i];
-      bufR[i] = inBuf[2*i+1];
+      *bufL++ = *inBuf++;
+      *bufR++ = *inBuf++;
     }
 
     return RES_OK;
@@ -634,7 +654,7 @@ static tErrorCode EncodeBuffer(int16_t *outBuf, int16_t *bufL, int16_t *bufR,
 //   bufL: Pointer to the buffer where the left channel should be written
 //   bufR: Pointer to the buffer where the right channel should be written
 //   length: Number of array positions to be decoded 
-// Returns: nothing
+// Returns: error code
 // *****************************************************************************
 {
   if ((NULL == outBuf) || (NULL == bufL) || (NULL == bufR)) 
@@ -643,8 +663,8 @@ static tErrorCode EncodeBuffer(int16_t *outBuf, int16_t *bufL, int16_t *bufR,
   uint16_t i;
   for (i = 0; i < length; i++)
     {
-      outBuf[2*i] = bufL[i];
-      outBuf[2*i+1] = bufR[i];
+      *outBuf++ = *bufL++;
+      *outBuf++ = *bufR++;
     }
 
     return RES_OK;
@@ -658,7 +678,7 @@ static tErrorCode ApplyFilters(int16_t *bufL, int16_t *bufR, uint16_t length)
 //   bufL: Pointer to the buffer storing the left channel data
 //   bufR: Pointer to the buffer storing the right channel data
 //   length: Number of array positions to be filtered
-// Returns: 
+// Returns: error code
 // *****************************************************************************
 {
   if ((2 > length) || (NULL == bufL) || (NULL == bufR)) 
@@ -706,6 +726,8 @@ static tErrorCode ProcessData(void)
       
     case 1: // Buffer half full, process first half
       
+      if (RES_OK != Uint24ToInt16(&adc_buf[0], BUFFER_SIZE/2)) return RES_ERROR;
+      
       // Decode input buffer
       if (RES_OK != DecodeBuffer(&adc_buf[0], &bufL[0], &bufR[0], 
                     BUFFER_SIZE/2)) return RES_ERROR;
@@ -720,6 +742,8 @@ static tErrorCode ProcessData(void)
         break;
 
     case 2: // Buffer full, process second half
+      
+      if (RES_OK != Uint24ToInt16(&adc_buf[BUFFER_SIZE], BUFFER_SIZE/2)) return RES_ERROR;
 
       // Decode input buffer
       if (RES_OK != DecodeBuffer(&adc_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
