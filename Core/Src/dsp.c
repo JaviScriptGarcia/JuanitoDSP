@@ -55,43 +55,41 @@
 // Functions 
 
 // *****************************************************************************
-tErrorCode DSP_SecondOrderLP(int16_t *buf, uint16_t nSamples, 
+tErrorCode DSP_SecondOrderIIR(int16_t *buf, uint16_t nSamples, 
                              tInstanceIIR *inst, tCoeffsIIR coeff)
 // *****************************************************************************
-// Description: Basic second order lowpass filter for left channel. Filter
+// Description: Basic second order filter for left channel. Filter
 // structure is direct form II
 // Parameters: 
-//   *buf: pointer to the buffer containing data to be proccessed
-//   nSamples: number of samples to proccess
+//   *buf: pointer to the buffer containing data to be processed
+//   nSamples: number of samples to process
 //   *instance: pointer to structure storing feedfoward and feedback samples
 //   coeffs: structure containing filter coefficients
 //   Returns: output sample
 // *****************************************************************************
 {
 	uint16_t i = 0; // Index used in loop
-	int16_t x; // backup for the current input sample
+    int32_t t;      // Temporal variable
+	int32_t y;      // Work with 32 bits to prevent overflow
 
 	if ((NULL == buf) || (NULL == inst)) return RES_ERROR;
 
 	for (i = 0; i < nSamples; i++)
 	{
-	  // Copy the value of the current input sample
-	  x = buf[i];
-
+      t = buf[i] - coeff.a1 * (*inst).t1 - coeff.a2 * (*inst).t2;
 	  // Difference equation
-	  buf[i] = (*inst).x1 * coeff.cx1 + (*inst).x2 * coeff.cx2 + 
-	  (*inst).y1 * coeff.cy1 - (*inst).y2 * coeff.cy2;
+	  y = t * coeff.b0 + coeff.b1 * (*inst).t1 + 
+	  coeff.b2 * (*inst).t2;
 
+      buf[i] = (int16_t)y;
       // Update feedback and feedfoward components
-	  (*inst).x2 = (*inst).x1;
-	  (*inst).x1 = x;
-	  (*inst).y2 = (*inst).y1;
-	  (*inst).y1 = buf[i];
+	  (*inst).t2 = (*inst).t1;
+	  (*inst).t1 = t;
 	}
 
-	// ly =  lu1 * 0.0003964 + lu2 * 0.0003911 + ly1 * 1.96 - ly2 * 0.9607;
 	return RES_OK;
 }
+
 
 
 // *****************************************************************************
@@ -116,10 +114,11 @@ void DSP_TestFilterInstances(tCoeffsIIR *coeffs)
 // Returns: 
 // *****************************************************************************
 {
-  (*coeffs).cx1 = 0.0003964;
-  (*coeffs).cx2 = 0.0003911;
-  (*coeffs).cy1 = 1.96;
-  (*coeffs).cy2 = 0.9607;
+  (*coeffs).b0 =   0.003916123487156427;
+  (*coeffs).b1 =  0.007832246974312854;
+  (*coeffs).b2 =  0.003916123487156427;
+  (*coeffs).a1 =  -1.8153396116625289;
+  (*coeffs).a2 =  0.8310041056111546;
 }
 
 
@@ -135,15 +134,14 @@ void DSP_Init(tInstanceIIR *inst, tCoeffsIIR *coeffs)
 	
 	for (i = 0; i<MAX_FILTERS; i++)
 	{
-      inst[i].x1 = 0;
-      inst[i].x2 = 0;
-      inst[i].y1 = 0;
-      inst[i].y2 = 0;
+      inst[i].t1 = 0;
+      inst[i].t2 = 0;
 
-	  coeffs[i].cx1 = 0;
-      coeffs[i].cx2 = 0;
-      coeffs[i].cy1 = 0;
-      coeffs[i].cy2 = 0;
+	  coeffs[i].b0 = 0;
+      coeffs[i].b1 = 0;
+      coeffs[i].b2 = 0;
+      coeffs[i].a1 = 0;
+	  coeffs[i].a2 = 0;
 	}
 	
 }

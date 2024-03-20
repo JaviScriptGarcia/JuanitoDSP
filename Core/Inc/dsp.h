@@ -11,6 +11,7 @@
 #include <math.h>
 #include "global.h"
 
+
 // *****************************************************************************
 // Defines 
 #ifndef __FPU_PRESENT
@@ -25,12 +26,12 @@
 
 typedef struct
 {
-  int16_t x1, x2, y1, y2;
+  int32_t t1, t2;
 } tInstanceIIR;
 
 typedef struct 
 {
-  float cx1, cx2, cy1, cy2;
+  float b0, b1, b2, a1, a2;
 } tCoeffsIIR;
 
 typedef struct
@@ -43,7 +44,7 @@ typedef struct
 // *****************************************************************************
 // Functions 
 
-tErrorCode DSP_SecondOrderLP(int16_t *buf, uint16_t nSamples, 
+tErrorCode DSP_SecondOrderIIR(int16_t *buf, uint16_t nSamples, 
                              tInstanceIIR *inst, tCoeffsIIR coeff);
 void DSP_TestFilterInstances(tCoeffsIIR *coeffs);
 void DSP_Init(tInstanceIIR *inst, tCoeffsIIR *coeffs);
