@@ -18,7 +18,8 @@ typedef enum
   RES_OK            = 0,
   RES_ERROR         = 1,
   RES_ERROR_PARAM   = 2,
-  RES_ERROR_TIMEOUT = 3
+  RES_ERROR_TIMEOUT = 3,
+  RES_ERROR_CONFIG  = 4,
 } tErrorCode;
 
 // *****************************************************************************

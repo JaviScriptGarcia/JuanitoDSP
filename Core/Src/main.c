@@ -35,9 +35,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define BUFFER_SIZE 128 
-
+#define BUFFER_SIZE 64
 #define DMA_INT_PERIOD ((BUFFER_SIZE / 2) * 100000 / SAMPLE_RATE) // 10 x us
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,15 +66,24 @@ int16_t bufR[BUFFER_SIZE];  // Right channel buffer
 
 int16_t dac_buf[BUFFER_SIZE*2]; // Send buffer
 
+// *****************************************************************************
+// IIR 2nd order biquads
 tInstanceIIR ins2ndIIR[MAX_FILTERS]; // IIR 2nd order instance
-tCoeffsIIR coef2ndIIR[MAX_FILTERS];  // IIR 2nd order coefficients
+tParamConfig pCfg2ndIIR[MAX_FILTERS];// IIR 2nd order configuration parameters
+// *****************************************************************************
+
+// *****************************************************************************
+// IIR ARM lib 2nd order biquads pointer instance
+arm_biquad_cascade_df2T_instance_f32 insLibIIR[MAX_FILTERS];
+// *****************************************************************************
+
 
 // arm_fir_instance_f32 S;
 
 uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
 uint32_t timerCount = 0;   // Performance monitor
 uint32_t cpuUsage = 0;
-uint8_t nIIRFilts = 2;     // Number of IIR filters in use
+uint8_t nIIRFilts = 4;     // Number of IIR filters in use
 uint32_t count = 0;
 
 /* USER CODE END PV */
@@ -110,7 +119,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -120,9 +129,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  DSP_Init(&ins2ndIIR[0], &coef2ndIIR[0]);
-  DSP_TestFilterInstances(&coef2ndIIR[0]);
-  DSP_TestFilterInstances(&coef2ndIIR[1]);
+  DSP_Init(ins2ndIIR);
+  DSP_TestFilters(pCfg2ndIIR);
+  DSP_UpdateFilterInstances(pCfg2ndIIR, ins2ndIIR, insLibIIR);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -141,9 +150,7 @@ int main(void)
 	#else
     HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac_buf, BUFFER_SIZE*2);
 	#endif
-
     HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc_buf, BUFFER_SIZE*2);
-
 
   /* USER CODE END 2 */
 
@@ -558,7 +565,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     // if (nFiltIIRLP > 2) nFiltIIRLP = 0;
     // count = 0;
     // }
-    count++;
+    // count++;
     // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14); 				// Toggle LED rojo
   }
   if(htim->Instance == TIM3)
@@ -596,81 +603,6 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 }
 
 // *****************************************************************************
-static tErrorCode Uint24ToInt16(uint32_t *inBuf, uint16_t length)
-// *****************************************************************************
-// Description: Converts received samples from unsigned 24 bit to signed 16 bit
-// Parameters:
-//   inBuf: Pointer to the first input buffer position to be converted
-//   length: Number of array positions to convert 
-// Returns: error code
-// *****************************************************************************
-{
-  if ((NULL == inBuf)) 
-  {return RES_ERROR_PARAM;}
-  
-  uint16_t i;
-  for (i = 0; i < length; i++)
-    {
-    	*inBuf++ = (*inBuf)>>8; 	  //Convert from 24 unsigned to 16 signed.
-    	*inBuf++ = (*inBuf)>>8; //Convert from 24 unsigned to 16 signed.
-    }
-
-    return RES_OK;
-}
-
-// *****************************************************************************
-static tErrorCode DecodeBuffer(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
-                               uint16_t length)
-// *****************************************************************************
-// Description: Decodes a PCM-formatted buffer into two buffers of half length
-// Parameters:
-//   inBuf: Pointer to the beginning input buffer position to be decoded
-//   bufL: Pointer to the buffer where the left channel should be written
-//   bufR: Pointer to the buffer where the right channel should be written
-//   length: Number of array positions to be decoded 
-// Returns: error code
-// *****************************************************************************
-{
-  if ((NULL == inBuf) || (NULL == bufL) || (NULL == bufR)) 
-  {return RES_ERROR_PARAM;}
-  
-  uint16_t i;
-  for (i = 0; i < length; i++)
-    {
-      *bufL++ = *inBuf++;
-      *bufR++ = *inBuf++;
-    }
-
-    return RES_OK;
-}
-
-// *****************************************************************************
-static tErrorCode EncodeBuffer(int16_t *outBuf, int16_t *bufL, int16_t *bufR, 
-                               uint16_t length)
-// *****************************************************************************
-// Description: Encodes a PCM-formatted buffer into two buffers of half length
-// Parameters:
-//   outBuf: Pointer to the beginning output buffer position to start encoding
-//   bufL: Pointer to the buffer where the left channel should be written
-//   bufR: Pointer to the buffer where the right channel should be written
-//   length: Number of array positions to be decoded 
-// Returns: error code
-// *****************************************************************************
-{
-  if ((NULL == outBuf) || (NULL == bufL) || (NULL == bufR)) 
-  {return RES_ERROR_PARAM;}
-  
-  uint16_t i;
-  for (i = 0; i < length; i++)
-    {
-      *outBuf++ = *bufL++;
-      *outBuf++ = *bufR++;
-    }
-
-    return RES_OK;
-}
-
-// *****************************************************************************
 static tErrorCode ApplyFilters(int16_t *bufL, int16_t *bufR, uint16_t length)
 // *****************************************************************************
 // Description: Processes L&R channel buffers with desired filters
@@ -689,10 +621,14 @@ static tErrorCode ApplyFilters(int16_t *bufL, int16_t *bufR, uint16_t length)
   // LEFT CHANNEL
   for (i = 0; i < nIIRFilts; i+=2)
   {
+    #ifdef USE_LIBRARY
+    if (RES_OK != DSP_IIR_f32_arm(bufL, length, &insLibIIR[i])) return RES_ERROR;
+    #else
     // IIR filters
-    if (RES_OK != DSP_SecondOrderIIR(bufL, length, 
-        &ins2ndIIR[i], coef2ndIIR[i])) return RES_ERROR;
-    
+    if (RES_OK != DSP_IIR_f32(bufL, length, 
+        &ins2ndIIR[i])) return RES_ERROR;
+    #endif
+
     // FIR filters
     // Other filtering stages
   }
@@ -700,10 +636,13 @@ static tErrorCode ApplyFilters(int16_t *bufL, int16_t *bufR, uint16_t length)
   // RIGHT CHANNEL
   for (i = 1; i < nIIRFilts; i+=2)
   {
+    #ifdef USE_LIBRARY
+    if (RES_OK != DSP_IIR_f32_arm(bufR, length, &insLibIIR[i])) return RES_ERROR;
+    #else
     // IIR filters
-    if (RES_OK != DSP_SecondOrderIIR(bufR, length, 
-        &ins2ndIIR[i], coef2ndIIR[i])) return RES_ERROR;
-
+    if (RES_OK != DSP_IIR_f32(bufR, length, 
+        &ins2ndIIR[i])) return RES_ERROR;
+    #endif
     // FIR filters
     // Other filtering stages
   }
@@ -726,10 +665,10 @@ static tErrorCode ProcessData(void)
       
     case 1: // Buffer half full, process first half
       
-      if (RES_OK != Uint24ToInt16(&adc_buf[0], BUFFER_SIZE/2)) return RES_ERROR;
+      if (RES_OK != DSP_Uint24ToInt16(&adc_buf[0], BUFFER_SIZE/2)) return RES_ERROR;
       
       // Decode input buffer
-      if (RES_OK != DecodeBuffer(&adc_buf[0], &bufL[0], &bufR[0], 
+      if (RES_OK != DSP_DecodePCM(&adc_buf[0], &bufL[0], &bufR[0], 
                     BUFFER_SIZE/2)) return RES_ERROR;
       
       // Apply filters
@@ -737,16 +676,16 @@ static tErrorCode ProcessData(void)
       {return RES_ERROR;}
 
       // Encode output buffer with PCM
-      if (RES_OK != EncodeBuffer(&dac_buf[0], &bufL[0], &bufR[0], 
+      if (RES_OK != DSP_EncodePCM(&dac_buf[0], &bufL[0], &bufR[0], 
                     BUFFER_SIZE/2)) return RES_ERROR;
         break;
 
     case 2: // Buffer full, process second half
       
-      if (RES_OK != Uint24ToInt16(&adc_buf[BUFFER_SIZE], BUFFER_SIZE/2)) return RES_ERROR;
+      if (RES_OK != DSP_Uint24ToInt16(&adc_buf[BUFFER_SIZE], BUFFER_SIZE/2)) return RES_ERROR;
 
       // Decode input buffer
-      if (RES_OK != DecodeBuffer(&adc_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
+      if (RES_OK != DSP_DecodePCM(&adc_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
                     &bufR[BUFFER_SIZE/2], BUFFER_SIZE/2)) return RES_ERROR;
       
       // Apply filters
@@ -754,7 +693,7 @@ static tErrorCode ProcessData(void)
                                  BUFFER_SIZE/2)){return RES_ERROR;}
 
       // Encode output buffer with PCM
-      if (RES_OK != EncodeBuffer(&dac_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
+      if (RES_OK != DSP_EncodePCM(&dac_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
                   &bufR[BUFFER_SIZE/2], BUFFER_SIZE/2)) return RES_ERROR;
         break;
     
@@ -762,7 +701,7 @@ static tErrorCode ProcessData(void)
         break;
   }
   
-  //while(timerCount < 1.01 * DMA_INT_PERIOD) ADD THIS BEFORE ENCODING TO FUCK
+  //while(timerCount < 1.01 * DMA_INT_PERIOD) ADD BEFORE ENCODING TO TEST LIMIT
   cpuUsage = timerCount * 100 / DMA_INT_PERIOD;
   dataReadyFlag = 0;
   return RES_OK;
