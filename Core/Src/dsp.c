@@ -13,7 +13,7 @@
 #include "dsp.h"
 
 // *****************************************************************************
-// Defines 
+// Defines s
 
 #define BLOCK_SIZE            32
 #define NUM_TAPS              29
