@@ -35,8 +35,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define BUFFER_SIZE 64
+#define BUFFER_SIZE 128
+#define BUF_BEGIN 0
+#define BUF_HALF (BUFFER_SIZE/2)
 #define DMA_INT_PERIOD ((BUFFER_SIZE / 2) * 100000 / SAMPLE_RATE) // 10 x us
+#define DAC_QUANTITY 1
+#define ADC_QUANTITY 1
+#define MAX_CHANNELS 4
 
 /* USER CODE END PD */
 
@@ -57,34 +62,44 @@ TIM_HandleTypeDef htim16;
 
 /* USER CODE BEGIN PV */
 
-//DEFINICION DE ARRAYS O BUFFERS
+typedef union
+{
+  float f32[BUFFER_SIZE];
+  int16_t q15[BUFFER_SIZE];
+} tUnionBuf;
 
-uint32_t adc_buf[BUFFER_SIZE*2]; //  Reception buffer
+typedef enum
+{
+  FLOAT_POINT,
+  FIXED_POINT
+} tArithmetic;
 
-int16_t bufL[BUFFER_SIZE];  // Left channel buffer
-int16_t bufR[BUFFER_SIZE];  // Right channel buffer
-
-int16_t dac_buf[BUFFER_SIZE*2]; // Send buffer
+// *****************************************************************************
+// INPUT, OUTPUT AND PROCESSING BUFFERS
+static uint32_t adc[BUFFER_SIZE*2];                  //  RX buffer (Stereo PCM)
+static int16_t dac[BUFFER_SIZE*2];                   //  TX buffer (Stereo PCM)
+static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE]; //  Processing buffers
+// *****************************************************************************
 
 // *****************************************************************************
 // IIR 2nd order biquads
-tInstanceIIR ins2ndIIR[MAX_FILTERS]; // IIR 2nd order instance
-tParamConfig pCfg2ndIIR[MAX_FILTERS];// IIR 2nd order configuration parameters
+static tInstanceIIR ins2ndIIR[MAX_FILTERS];  // IIR 2nd order instance
+static tParamConfig pCfg2ndIIR[MAX_FILTERS]; // IIR 2nd order config parameters
 // *****************************************************************************
 
+#ifdef USE_LIBRARY
 // *****************************************************************************
-// IIR ARM lib 2nd order biquads pointer instance
-arm_biquad_cascade_df2T_instance_f32 insLibIIR[MAX_FILTERS];
+// IIR arm_math.h 2nd order biquads pointer instance
+static arm_biquad_cascade_df2T_instance_f32 insLibIIR[MAX_FILTERS];
 // *****************************************************************************
+#endif
 
-
-// arm_fir_instance_f32 S;
-
-uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
-uint32_t timerCount = 0;   // Performance monitor
-uint32_t cpuUsage = 0;
-uint8_t nIIRFilts = 4;     // Number of IIR filters in use
-uint32_t count = 0;
+// *****************************************************************************
+// APP LOGIC STATE VARIABLES
+static uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
+static uint32_t timerCount = 0;   // Performance monitor timer
+static float cpuUsage = 0;     // CPU real-time usage (%)
+// *****************************************************************************
 
 /* USER CODE END PV */
 
@@ -119,7 +134,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-   HAL_Init();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -129,7 +144,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  DSP_Init(ins2ndIIR);
+  DSP_Init(pCfg2ndIIR, ins2ndIIR, insLibIIR);
   DSP_TestFilters(pCfg2ndIIR);
   DSP_UpdateFilterInstances(pCfg2ndIIR, ins2ndIIR, insLibIIR);
   /* USER CODE END SysInit */
@@ -145,12 +160,8 @@ int main(void)
     HAL_TIM_Base_Start_IT(&htim16); // TIENE QUE ESTAR EN MODO IT (_IT al final) PARA PODER ARRANCAR EN MODO INTERRUPCION Y QUE EJECUTE LA RUTINA
     HAL_TIM_Base_Start_IT(&htim3);  //
 
-	#ifdef TEST
-    HAL_I2S_Transmit_DMA(&hi2s1, triangle_wave, BUFFER_SIZE*2);
-	#else
-    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac_buf, BUFFER_SIZE*2);
-	#endif
-    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc_buf, BUFFER_SIZE*2);
+    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac, BUFFER_SIZE*2);
+    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc, BUFFER_SIZE*2);
 
   /* USER CODE END 2 */
 
@@ -164,6 +175,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     error:
+      // Toggle an LED to notify error
       Error_Handler();
   /* USER CODE END 3 */
 }
@@ -556,21 +568,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if(htim->Instance == TIM16)
   {
-    // Performance monitor
-    timerCount++;
-
-    // if (count >30)
-    // {
-    // nFiltIIRLP++;
-    // if (nFiltIIRLP > 2) nFiltIIRLP = 0;
-    // count = 0;
-    // }
-    // count++;
-    // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14); 				// Toggle LED rojo
+    timerCount++; // Performance monitor increase, period = 10 uS
+    // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14); 				// Toggle LED red
   }
   if(htim->Instance == TIM3)
   {
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  					// Toggle LED rojo
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  					// Toggle LED red
   }
 }
 
@@ -584,8 +587,7 @@ void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef* hi2s2)
 {
     HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);   // Toggle LED amarillo
     dataReadyFlag = 1;
-    // Performance monitor
-    timerCount = 0;
+    timerCount = 0; // Performance monitor reset timer
 }
 
 // *****************************************************************************
@@ -598,103 +600,197 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 {
     HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);     // Toggle LED verde
     dataReadyFlag = 2;
-    // Performance monitor
-    timerCount = 0;
+    timerCount = 0; // Performance monitor reset timer
 }
 
 // *****************************************************************************
-static tErrorCode ApplyFilters(int16_t *bufL, int16_t *bufR, uint16_t length)
+static tErrorCode ApplyFilters(void *inBuf, tInstanceIIR *inst, 
+                               arm_biquad_cascade_df2T_instance_f32 *s,
+                               uint32_t nSamples, tArithmetic bufType)
 // *****************************************************************************
-// Description: Processes L&R channel buffers with desired filters
+// Description: Processes multiple channels with desired filters
 // Parameters: 
-//   bufL: Pointer to the buffer storing the left channel data
-//   bufR: Pointer to the buffer storing the right channel data
-//   length: Number of array positions to be filtered
+//   *inBuf: Pointer to the buffer storing all channels
+//   *inst: Pointer to the IIR filter instance
+//   *s: Pointer to the IIR arm_math filter instance
+//   nSamples: Number of array positions to be filtered
+//   bufType: Type of aritmethic to use, must match the channel type (int/float)
 // Returns: error code
 // *****************************************************************************
 {
-  if ((2 > length) || (NULL == bufL) || (NULL == bufR)) 
+  if ((2 > nSamples) || (NULL == inst) || (NULL == inBuf)) 
   {return RES_ERROR_PARAM;}
-
   uint8_t i;
 
-  // LEFT CHANNEL
-  for (i = 0; i < nIIRFilts; i+=2)
+  if (FIXED_POINT == bufType)
   {
-    #ifdef USE_LIBRARY
-    if (RES_OK != DSP_IIR_f32_arm(bufL, length, &insLibIIR[i])) return RES_ERROR;
-    #else
-    // IIR filters
-    if (RES_OK != DSP_IIR_f32(bufL, length, 
-        &ins2ndIIR[i])) return RES_ERROR;
-    #endif
-
-    // FIR filters
-    // Other filtering stages
+    // FIXED POINT PROCESSING
   }
 
-  // RIGHT CHANNEL
-  for (i = 1; i < nIIRFilts; i+=2)
+  if (FLOAT_POINT == bufType)
   {
-    #ifdef USE_LIBRARY
-    if (RES_OK != DSP_IIR_f32_arm(bufR, length, &insLibIIR[i])) return RES_ERROR;
-    #else
-    // IIR filters
-    if (RES_OK != DSP_IIR_f32(bufR, length, 
-        &ins2ndIIR[i])) return RES_ERROR;
-    #endif
-    // FIR filters
-    // Other filtering stages
+    uint16_t filterChan = 0;
+    uint16_t chanLength = nSamples*2;
+    for (i = 0; i < MAX_FILTERS; i++)
+    {
+      if (CHANNEL_NONE != (*inst).channel)
+      {
+        filterChan = (*inst).channel;
+        #ifdef USE_LIBRARY
+        if (RES_OK != DSP_IIR_f32_arm((float *)inBuf + (filterChan * chanLength),
+                      nSamples, s))
+        {return RES_ERROR;}
+        #else
+        if (RES_OK != DSP_IIR_f32(inBuf + (*inst).channel * nSamples*2,
+                      nSamples, inst))
+        {return RES_ERROR;}
+        #endif
+      }
+      s++;
+      inst++;
+    }
   }
+
+  else return RES_ERROR_PARAM;
+
+  // Other filtering stages
   return RES_OK;
 }
 
 // *****************************************************************************
+static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR, 
+                             uint32_t nSamples, tArithmetic bufType)
+// *****************************************************************************
+// Description: Decodes a buffer of PCM data from the PCM1808 ADC
+// Parameters: 
+//   *inBuf: Pointer to the buffer containing stereo data sent by the ADC
+//   *outBufL: Pointer to the buffer where the left channel data will be stored
+//   *outBufR: Pointer to the buffer where the right channel data will be stored
+//   nSamples: Number of samples of one mono channel
+//   bufType: Type of arithmetic that will be used
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((2 > nSamples) || (NULL == inBuf) || 
+     (NULL == outBufL) || (NULL == outBufR)) return RES_ERROR_PARAM;
+
+  if (RES_OK != DSP_Int24ToInt16(inBuf, nSamples*2))
+  {return RES_ERROR;}
+  
+  if (FIXED_POINT == bufType)
+  {
+      if (RES_OK != DSP_DecodePCM(inBuf, (int16_t *)outBufL, (int16_t *)outBufR,
+                    nSamples)) return RES_ERROR;
+  }
+
+  if (FLOAT_POINT == bufType)
+  {
+    if (RES_OK != DSP_DecodePCM(inBuf, (int16_t *)outBufL, (int16_t *)outBufR, 
+                  nSamples)) 
+    {return RES_ERROR;}
+    if (RES_OK != DSP_q15_to_f32_arm((int16_t *)outBufL, (float *)outBufL, 
+                  nSamples))
+    {return RES_ERROR;}
+    if (RES_OK != DSP_q15_to_f32_arm((int16_t *)outBufR, (float *)outBufR, 
+                  nSamples))
+    {return RES_ERROR;}
+  }
+
+  else return RES_ERROR_PARAM;
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+static tErrorCode EncodeData(void *inBufL, void *inBufR, int16_t *outBuf,
+                             uint32_t nSamples, tArithmetic bufType)
+// *****************************************************************************
+// Description: Decodes a buffer of PCM data to the PCM5102 DAC
+// Parameters: 
+//   *inBufL: Pointer to the buffer where the left channel data is stored
+//   *inBufR: Pointer to the buffer where the right channel data is stored
+//   *outBuf: Pointer to the buffer that will store stereo data for the DAC
+//   nSamples: Number of samples of one mono channel
+//   bufType: Type of arithmetic that will be used
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((2 > nSamples) || (NULL == outBuf) || 
+     (NULL == inBufL) || (NULL == inBufR)) return RES_ERROR_PARAM;
+  
+  if (FIXED_POINT == bufType)
+  {
+
+    if (RES_OK != DSP_EncodePCM(outBuf, (int16_t *)inBufL, (int16_t *)inBufR,
+                  nSamples)) return RES_ERROR;
+  }
+
+  if (FLOAT_POINT == bufType)
+  {
+    if (RES_OK != DSP_f32_to_q15_arm((float *)inBufL, (int16_t *)inBufL,
+                  nSamples)) return RES_ERROR;
+    if (RES_OK != DSP_f32_to_q15_arm((float *)inBufR, (int16_t *)inBufR, 
+                  nSamples)) return RES_ERROR;
+    if (RES_OK != DSP_EncodePCM(outBuf, (int16_t *)inBufL, (int16_t *)inBufR, 
+                  nSamples)) return RES_ERROR;
+  }
+
+  else return RES_ERROR_PARAM;
+
+  return RES_OK;
+}
+// *****************************************************************************
 static tErrorCode ProcessData(void)
 // *****************************************************************************
-// Description: Processsing function. Processes the buffer as desired.
+// Description: Processsing function. FSM managing application functions.
 // Parameters: none
 // Returns: error code
 // *****************************************************************************
 {
+
   switch (dataReadyFlag)
   {
     
-    case 0: // Buffer receiving data
+    case 0: // Buffer still receiving data
       return RES_OK;
       
     case 1: // Buffer half full, process first half
       
-      if (RES_OK != DSP_Uint24ToInt16(&adc_buf[0], BUFFER_SIZE/2)) return RES_ERROR;
-      
-      // Decode input buffer
-      if (RES_OK != DSP_DecodePCM(&adc_buf[0], &bufL[0], &bufR[0], 
-                    BUFFER_SIZE/2)) return RES_ERROR;
-      
-      // Apply filters
-      if (RES_OK != ApplyFilters(&bufL[0], &bufR[0], BUFFER_SIZE/2)) 
+      // Decode ADC1 from PCM
+      if (RES_OK != DecodeData(&adc[BUF_BEGIN], 
+                    &general[CHANNEL_0][BUF_BEGIN],
+                    &general[CHANNEL_1][BUF_BEGIN], 
+                    BUF_HALF, FLOAT_POINT)) return RES_ERROR;
+
+      // Filter all channels
+      if (RES_OK != ApplyFilters(&general[0][BUF_BEGIN], ins2ndIIR, insLibIIR,
+                                 BUF_HALF, FLOAT_POINT))
       {return RES_ERROR;}
 
-      // Encode output buffer with PCM
-      if (RES_OK != DSP_EncodePCM(&dac_buf[0], &bufL[0], &bufR[0], 
-                    BUFFER_SIZE/2)) return RES_ERROR;
+      // Encode DAC1 to PCM
+      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_BEGIN], 
+                    &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], 
+                    BUF_HALF, FLOAT_POINT)) return RES_ERROR;
         break;
 
     case 2: // Buffer full, process second half
       
-      if (RES_OK != DSP_Uint24ToInt16(&adc_buf[BUFFER_SIZE], BUFFER_SIZE/2)) return RES_ERROR;
+      // Decode ADC1 from PCM
+      if (RES_OK != DecodeData(&adc[BUFFER_SIZE], 
+                    &general[CHANNEL_0][BUF_HALF],
+                    &general[CHANNEL_1][BUF_HALF],
+                    BUF_HALF, FLOAT_POINT)) return RES_ERROR;
 
-      // Decode input buffer
-      if (RES_OK != DSP_DecodePCM(&adc_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
-                    &bufR[BUFFER_SIZE/2], BUFFER_SIZE/2)) return RES_ERROR;
-      
-      // Apply filters
-      if (RES_OK != ApplyFilters(&bufL[BUFFER_SIZE/2], &bufR[BUFFER_SIZE/2], 
-                                 BUFFER_SIZE/2)){return RES_ERROR;}
+      // Filter all channels
+      if (RES_OK != ApplyFilters(&general[0][BUF_HALF], ins2ndIIR, 
+                    insLibIIR, BUF_HALF, FLOAT_POINT)) 
+      {return RES_ERROR;}
 
-      // Encode output buffer with PCM
-      if (RES_OK != DSP_EncodePCM(&dac_buf[BUFFER_SIZE], &bufL[BUFFER_SIZE/2],
-                  &bufR[BUFFER_SIZE/2], BUFFER_SIZE/2)) return RES_ERROR;
+
+      // Encode DAC1 to PCM
+      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_HALF], 
+                    &general[CHANNEL_1][BUF_HALF], &dac[BUFFER_SIZE],
+                    BUF_HALF, FLOAT_POINT)) return RES_ERROR;
         break;
     
     default:
