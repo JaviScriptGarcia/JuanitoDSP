@@ -15,28 +15,20 @@
 
 // *****************************************************************************
 // Defines 
+// FIR filters
 #define BLOCK_SIZE            32
 #define NUM_TAPS              29
+
+// Frequency response plot parameters
 #define PLOT_RESOLUTION       31
 #define PLOTX_START           20.0    //Hz
 #define PLOTX_END             20000.0 //Hz
 
 // Macros
-#define c2d(a) (a/((float)SAMPLE_RATE/2)) // Convert to discrete frequency
+#define c2d(a) (a/((double)SAMPLE_RATE/2)) // Convert to discrete frequency
 
 // *****************************************************************************
 // Variables 
-
-//FIR struct init
-// static float32_t firStateF32[BLOCK_SIZE + NUM_TAPS - 1];
-
-// FIR Coefficients buffer generated using fir1() MATLAB function. fir1(28, 6/24)
-// const float32_t firCoeffs32[NUM_TAPS] = {
-//   -0.0018225230f, -0.0015879294f, +0.0000000000f, +0.0036977508f, +0.0080754303f, +0.0085302217f, -0.0000000000f, -0.0173976984f,
-//   -0.0341458607f, -0.0333591565f, +0.0000000000f, +0.0676308395f, +0.1522061835f, +0.2229246956f, +0.2504960933f, +0.2229246956f,
-//   +0.1522061835f, +0.0676308395f, +0.0000000000f, -0.0333591565f, -0.0341458607f, -0.0173976984f, -0.0000000000f, +0.0085302217f,
-//   +0.0080754303f, +0.0036977508f, +0.0000000000f, -0.0015879294f, -0.0018225230f
-// };
 
 // *****************************************************************************
 // Functions 
@@ -49,180 +41,238 @@ tErrorCode DSP_IIR_f32(float *buf, uint32_t nSamples, tInstanceIIRf32 *inst)
 // Parameters: 
 //   *buf: pointer to the buffer containing data to be processed
 //   nSamples: number of samples to process
-//   *instance: pointer to structure storing coefficients and delayed samples
+//   *inst: pointer to structure storing coefficients and delayed samples
 // Returns: output sample
 // *****************************************************************************
 {
     if ((NULL == buf) || (NULL == inst)) return RES_ERROR_PARAM;
-    float t;        // Temporal variable   
-    float *pDelays = &((*inst).delays[0]); // Pointer to state buffer
+    float t;                          // Temporal variable   
+    float *pDelays = &(inst->delays); // Pointer to state buffer
+    float *pCoef = &(inst->coeffs);   // Pointer to filter coefficients
 
     for ( ;0 < nSamples--; buf++)
     {
-      // Transposed form 
-      //   y = (*inst).coeffs[0] * buf[i] + (*inst).delays[0];
-      //   (*inst).delays[0] = (*inst).coeffs[1] * buf[i] + (*inst).coeffs[3] * y 
-      //   + (*inst).delays[1];
-      //   (*inst).delays[1] = (*inst).coeffs[2] * buf[i] + (*inst).coeffs[4] * y;
-      //   buf[i] = (int16_t)y;
-
-      // Non-transposed form
-      t = *buf + (*inst).coeffs[3] * *pDelays + (*inst).coeffs[4] * *(pDelays+1);
-      *buf = t * (*inst).coeffs[0] + (*inst).coeffs[1] * *pDelays + 
-	    (*inst).coeffs[2] * *(pDelays+1);
+      // Direct form
+      t = *buf + pCoef[3] * pDelays[0] + pCoef[4] * pDelays[1];
+      *buf = t * pCoef[0] + pCoef[1] * pDelays[0] + pCoef[2] * pDelays[1];
 
       // Update feedback and feedfoward components
-      *(pDelays+1) = *pDelays;
-      *pDelays = t;
+      pDelays[1] = pDelays[0];
+      pDelays[0] = t;
     }
 
-	return RES_OK;
-}
-
-// *****************************************************************************
-tErrorCode DSP_IIR_f32_arm(float *buf, uint32_t nSamples, 
-                           arm_biquad_cascade_df2T_instance_f32 *s)
-// *****************************************************************************
-// Description: Basic second order filter for left channel. Filter
-// structure is direct form II. Floating point arithmetic.
-// Parameters: 
-//   *buf: pointer to the buffer containing data to be processed
-//   nSamples: number of samples to process
-//   *instance: pointer to structure storing coefficients and delayed samples
-//   Returns: error code
-// *****************************************************************************
-{
-	#ifdef USE_LIBRARY
-	if ((NULL == buf) || (NULL == s)) return RES_ERROR_PARAM;
-  arm_biquad_cascade_df2T_f32(s, buf, buf, nSamples);
-	return RES_OK;
-  #else 
-	return RES_ERROR_CONFIG;
-	#endif
+  return RES_OK;
 }
 
 // *****************************************************************************
 tErrorCode DSP_IIR_q15(int16_t *buf, uint32_t nSamples, tInstanceIIRq15 *inst)
 // *****************************************************************************
 // Description: Basic second order biquad filter. Filter structure is direct 
+// form I. Fixed point arithmetic.
+// Parameters: 
+//   *buf: pointer to the buffer containing data to be processed
+//   nSamples: Number of samples to process
+//   *inst: Pointer to structure storing coefficients and delayed samples
+// Returns: Error code
+// *****************************************************************************
+{
+    if ((NULL == buf) || (NULL == inst)) return RES_ERROR_PARAM;
+    int32_t acc;                     // 32 bit Accumulator   
+    int16_t *pDelays = inst->delays; // Pointer to state buffer
+
+    // Reserve 32 bit variables to perform operations without overflow
+    int32_t coef[5] = {inst->coeffs[0], inst->coeffs[2], inst->coeffs[3],
+                       inst->coeffs[4], inst->coeffs[5]};
+
+    for ( ;0 < nSamples--; buf++)
+    {
+
+      acc = (coef[0] * *buf);
+      acc += (coef[1] * pDelays[0]);
+      acc += (coef[2] * pDelays[1]);
+      acc += (coef[3] * pDelays[2]);
+      acc += (coef[4] * pDelays[3]);
+      acc >>= (15 - inst->postShift);
+      if (acc > SHRT_MAX) acc = SHRT_MAX;
+      else if (acc < SHRT_MIN) acc = SHRT_MIN;
+      
+      // Update feedback and feedfoward components
+      pDelays[1] = pDelays[0]; // x_2 = x_1
+      pDelays[0] = *buf;       // x_1 = x
+      pDelays[3] = pDelays[2]; // y_2 = y_1
+      pDelays[2] = acc;        // y_1 = y
+
+      *buf = acc;
+    }
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_IIR_q31(int32_t *buf, uint32_t nSamples, tInstanceIIRq31 *inst)
+// *****************************************************************************
+// Description: Basic second order biquad filter. Filter structure is direct 
 // form II. Floating point arithmetic.
 // Parameters: 
 //   *buf: pointer to the buffer containing data to be processed
 //   nSamples: number of samples to process
-//   *instance: pointer to structure storing coefficients and delayed samples
-// Returns: output sample
+//   *inst: pointer to structure storing coefficients and delayed samples
+// Returns: Error code
 // *****************************************************************************
 {
-    // if ((NULL == buf) || (NULL == inst)) return RES_ERROR_PARAM;
-    // float t;        // Temporal variable   
-    // float *pDelays = &((*inst).delays[0]); // Pointer to state buffer
+    if ((NULL == buf) || (NULL == inst)) return RES_ERROR_PARAM;
+    int64_t acc;                     // 64 bit Accumulator   
+    int32_t *pDelays = inst->delays; // Pointer to state buffer
 
-    // for ( ;0 < nSamples--; buf++)
-    // {
-    //   // Transposed form 
-    //   //   y = (*inst).coeffs[0] * buf[i] + (*inst).delays[0];
-    //   //   (*inst).delays[0] = (*inst).coeffs[1] * buf[i] + (*inst).coeffs[3] * y 
-    //   //   + (*inst).delays[1];
-    //   //   (*inst).delays[1] = (*inst).coeffs[2] * buf[i] + (*inst).coeffs[4] * y;
-    //   //   buf[i] = (int16_t)y;
+    // Reserve 64 bit variables to perform operations without overflow
+    int64_t coef[5] = {inst->coeffs[0], inst->coeffs[1], inst->coeffs[2],
+                       inst->coeffs[3], inst->coeffs[4]};
 
-    //   // Non-transposed form
-    //   t = *buf + (*inst).coeffs[3] * *pDelays + (*inst).coeffs[4] * *(pDelays+1);
-    //   *buf = t * (*inst).coeffs[0] + (*inst).coeffs[1] * *pDelays + 
-	  //   (*inst).coeffs[2] * *(pDelays+1);
+    for ( ;0 < nSamples--; buf++)
+    {
 
-    //   // Update feedback and feedfoward components
-    //   *(pDelays+1) = *pDelays;
-    //   *pDelays = t;
-    // }
+      acc = (coef[0] * *buf);
+      acc += (coef[1] * pDelays[0]);
+      acc += (coef[2] * pDelays[1]);
+      acc += (coef[3] * pDelays[2]);
+      acc += (coef[4] * pDelays[3]);
+      acc >>= (31 - inst->postShift);
+      if (acc > LONG_MAX) acc = LONG_MAX;
+      else if (acc < LONG_MIN) acc = LONG_MIN;
+      
+      // Update feedback and feedfoward components
+      pDelays[1] = pDelays[0]; // x_2 = x_1
+      pDelays[0] = *buf;       // x_1 = x
+      pDelays[3] = pDelays[2]; // y_2 = y_1
+      pDelays[2] = acc;        // y_1 = y
 
-	return RES_OK;
+      *buf = acc;
+    }
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_IIR_f32_arm(float *buf, uint32_t nSamples, 
+                           arm_biquad_cascade_df2T_instance_f32 *s)
+// *****************************************************************************
+// Description: Basic second order biquad filter. Filter structure is direct 
+// form II. Floating point arithmetic. Only for ARM MCUs.
+// Parameters: 
+//   *buf: Pointer to the buffer containing data to be processed
+//   nSamples: Number of samples to process
+//   *s: Pointer to structure storing coefficients and delayed samples
+//   Returns: Error code
+// *****************************************************************************
+{
+  #ifdef USE_LIBRARY
+  if ((NULL == buf) || (NULL == s)) return RES_ERROR_PARAM;
+  arm_biquad_cascade_df2T_f32(s, buf, buf, nSamples);
+  return RES_OK;
+  #else 
+  return RES_ERROR_CONFIG;
+  #endif
 }
 
 // *****************************************************************************
 tErrorCode DSP_IIR_q15_arm(int16_t *buf, uint32_t nSamples, 
                            arm_biquad_casd_df1_inst_q15 *q)
 // *****************************************************************************
-// Description: Basic second order filter for left channel. Filter
-// structure is direct form II. Floating point arithmetic.
+// Description: Basic second order biquad filter. Filter structure is direct 
+// form I. Fixed point arithmetic. Only for ARM MCUs.
 // Parameters: 
 //   *buf: pointer to the buffer containing data to be processed
 //   nSamples: number of samples to process
-//   *instance: pointer to structure storing coefficients and delayed samples
+//   *q: pointer to structure storing coefficients and delayed samples
 //   Returns: error code
 // *****************************************************************************
 {
-	#ifdef USE_LIBRARY
-	if ((NULL == buf) || (NULL == q)) return RES_ERROR_PARAM;
+  #ifdef USE_LIBRARY
+  if ((NULL == buf) || (NULL == q)) return RES_ERROR_PARAM;
   arm_biquad_cascade_df1_q15(q, buf, buf, nSamples);
-	return RES_OK;
+  return RES_OK;
   #else 
-	return RES_ERROR_CONFIG;
-	#endif
+  return RES_ERROR_CONFIG;
+  #endif
 }
 
 // *****************************************************************************
 tErrorCode DSP_IIR_q31_arm(int32_t *buf, uint32_t nSamples, 
-                           arm_biquad_casd_df1_inst_q31 *q)
+                           arm_biquad_casd_df1_inst_q31 *r)
 // *****************************************************************************
-// Description: Basic second order filter for left channel. Filter
-// structure is direct form II. Floating point arithmetic.
+// Description: Basic second order biquad filter. Filter structure is direct 
+// form I. Fixed point arithmetic. Only for ARM MCUs.
 // Parameters: 
-//   *buf: pointer to the buffer containing data to be processed
-//   nSamples: number of samples to process
-//   *instance: pointer to structure storing coefficients and delayed samples
+//   *buf: Pointer to the buffer containing data to be processed
+//   nSamples: Number of samples to process
+//   *r: Pointer to structure storing coefficients and delayed samples
 //   Returns: error code
 // *****************************************************************************
 {
-	#ifdef USE_LIBRARY
-	if ((NULL == buf) || (NULL == q)) return RES_ERROR_PARAM;
-  arm_biquad_cascade_df1_q31(q, buf, buf, nSamples);
-	return RES_OK;
+  #ifdef USE_LIBRARY
+  if ((NULL == buf) || (NULL == r)) return RES_ERROR_PARAM;
+  arm_biquad_cascade_df1_q31(r, buf, buf, nSamples);
+  return RES_OK;
   #else 
-	return RES_ERROR_CONFIG;
-	#endif
+  return RES_ERROR_CONFIG;
+  #endif
 }
 
 // *****************************************************************************
 tErrorCode DSP_q15_to_f32_arm(int16_t *inBuf, float *outBuf, uint32_t nSamples)
 // *****************************************************************************
-// Description: Converts passed int16_t buffer into float 32 using arm_math.h
+// Description: Converts passed int16_t buffer into float 32. Only for ARM MCUs.
 // Parameters: 
-//   *inBuf: pointer to buffer containing q15 data
-//   *outBuf: pointer to buffer that will store f32 data
-//    nSamples: number of samples to convert
-// Returns: error code
+//   *inBuf: Pointer to buffer containing q15 data
+//   *outBuf: Pointer to buffer that will store f32 data
+//    nSamples: Number of samples to convert
+// Returns: Error code
 // *****************************************************************************
 {
-	#ifdef USE_LIBRARY
-	if ((NULL == inBuf) || (NULL == outBuf)) return RES_ERROR_PARAM;
+  if ((NULL == inBuf) || (NULL == outBuf)) return RES_ERROR_PARAM;
+
   int16_t auxBuf[nSamples];
-  memcpy(auxBuf, inBuf, sizeof(int16_t)*nSamples);
+  // arm_shift_q15(inBuf, 0, auxBuf, nSamples); // Performs similar to memmove 
+  memmove(auxBuf, inBuf, sizeof(int16_t)*nSamples); 
   arm_q15_to_float(auxBuf, outBuf, nSamples);
-	return RES_OK;
-    #else 
-	return RES_ERROR_CONFIG;
-	#endif
+
+  return RES_OK;
 }
 
 // *****************************************************************************
 tErrorCode DSP_f32_to_q15_arm(float *inBuf, int16_t *outBuf, uint32_t nSamples)
 // *****************************************************************************
-// Description: Converts passed int16_t buffer into float 32 using arm_math.h
+// Description: Converts passed float buffer into int16_t. Only for ARM MCUs.
 // Parameters: 
-//   *inBuf: pointer to buffer containing f32 data
-//   *outBuf: pointer to buffer that will store q15 data
-//    nSamples: number of samples to convert
-// Returns: error code
+//   *inBuf: Pointer to buffer containing f32 data
+//   *outBuf: Pointer to buffer that will store q15 data
+//    nSamples: Number of samples to convert
+// Returns: Error code
 // *****************************************************************************
 {
-	#ifdef USE_LIBRARY
-	if ((NULL == inBuf) || (NULL == outBuf)) return RES_ERROR_PARAM;
+  if ((NULL == inBuf) || (NULL == outBuf)) return RES_ERROR_PARAM;
+
   arm_float_to_q15(inBuf, outBuf, nSamples);
-	return RES_OK;
-  #else 
-	return RES_ERROR_CONFIG;
-	#endif
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_q31_to_q15_arm(int32_t *inBuf, int16_t *outBuf, uint32_t nSamples)
+// *****************************************************************************
+// Description: Converts passed int32_t buffer into int16_t. Only for ARM MCUs.
+// Parameters: 
+//   *inBuf: Pointer to buffer containing q31 data
+//   *outBuf: Pointer to buffer that will store q15 data
+//    nSamples: Number of samples to convert
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf) || (NULL == outBuf)) return RES_ERROR_PARAM;
+
+  arm_q31_to_q15(inBuf, outBuf, nSamples);
+
+  return RES_OK;
 }
 
 // *****************************************************************************
@@ -232,7 +282,7 @@ tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint32_t nSamples)
 // Parameters:
 //   inBuf: Pointer to the first input buffer position to be converted
 //   nSamples: Number of samples to convert 
-// Returns: error code
+// Returns: Error code
 // *****************************************************************************
 {
   if ((NULL == inBuf)) return RES_ERROR_PARAM;
@@ -246,7 +296,52 @@ tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint32_t nSamples)
 }
 
 // *****************************************************************************
-tErrorCode DSP_DecodePCM(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
+tErrorCode DSP_Int24ToInt32(uint32_t *inBuf, uint32_t nSamples)
+// *****************************************************************************
+// Description: Converts received samples from signed 24 bit to signed 16 bit
+// Parameters:
+//   inBuf: Pointer to the first input buffer position to be converted
+//   nSamples: Number of samples to convert 
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf)) return RES_ERROR_PARAM;
+  
+  while(0 < nSamples--)
+  {
+    *inBuf <<= 8; 
+    inBuf++;
+  }
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_DecodePCM_Int16(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
+                         uint32_t nSamples)
+// *****************************************************************************
+// Description: Decodes a PCM stereo buffer into two buffers of half length
+// Parameters:
+//   inBuf: Pointer to the beginning input buffer position to be decoded
+//   bufL: Pointer to the buffer where the left channel should be written
+//   bufR: Pointer to the buffer where the right channel should be written
+//   nSamples: Number of array positions to be decoded 
+// Returns: error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf) || (NULL == bufL) || (NULL == bufR) || (nSamples < 2)) 
+  {return RES_ERROR_PARAM;}
+  
+  while(0 < nSamples--)
+  {
+    *bufL++ = *inBuf++;
+    *bufR++ = *inBuf++;
+  }
+
+    return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_DecodePCM_Int32(uint32_t *inBuf, int32_t *bufL, int32_t *bufR, 
                          uint32_t nSamples)
 // *****************************************************************************
 // Description: Decodes a PCM stereo buffer into two buffers of half length
@@ -298,12 +393,12 @@ tErrorCode DSP_EncodePCM(int16_t *outBuf, int16_t *bufL, int16_t *bufR,
 // *****************************************************************************
 tErrorCode DSP_Gain_f32_arm(float *buf, float gain, int32_t nSamples)
 // *****************************************************************************
-// Description: Linear gain function for f32 arithmetic
+// Description: Linear gain function for f32 arithmetic. Only for ARM MCUs.
 // Parameters: 
 //   *buf: Pointer to the buffer to proccess
 //   gain: Linear gain to be applied
 //   nSamples: Number of samples to proccess
-// Returns: 
+// Returns: Error code
 // *****************************************************************************
 {
   if ((NULL == buf)) return RES_ERROR_PARAM;
@@ -317,24 +412,44 @@ tErrorCode DSP_Gain_f32_arm(float *buf, float gain, int32_t nSamples)
 tErrorCode DSP_Gain_q15_arm(int16_t *buf, int16_t gain, int8_t postShift, 
                             int32_t nSamples)
 // *****************************************************************************
-// Description: Linear gain function for q15 arithmetic
+// Description: Linear gain function for q15 arithmetic. Only for ARM MCUs.
 // Parameters: 
 //   *buf: Pointer to the buffer to proccess
 //   gain: Linear gain to be applied
 //   postShift: bitshift for q(15-postShift) format
 //   nSamples: Number of samples to proccess
-// Returns: 
+// Returns: Error code
 // *****************************************************************************
 {
   if ((NULL == buf)) return RES_ERROR_PARAM;
-  // if (((SHRT_MAX/2) < gain) && (0 >= postShift)) return RES_ERROR_MATH;
+  if ((0 > postShift) || (0 > gain)) return RES_ERROR_MATH;
 
   arm_scale_q15(buf, gain, postShift, buf, nSamples);
   return RES_OK;
 }
 
 // *****************************************************************************
-static tErrorCode DSP_PlotMagnitude(tInstanceIIRf32 *instf32, float *hLinear, 
+tErrorCode DSP_Gain_q31_arm(int32_t *buf, int32_t gain, int8_t postShift, 
+                            int32_t nSamples)
+// *****************************************************************************
+// Description: Linear gain function for q15 arithmetic. Only for ARM MCUs.
+// Parameters: 
+//   *buf: Pointer to the buffer to proccess
+//   gain: Linear gain to be applied
+//   postShift: Bitshift for q(31-postShift) format
+//   nSamples: Number of samples to proccess
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((NULL == buf)) return RES_ERROR_PARAM;
+  if ((0 > postShift) || (0 > gain)) return RES_ERROR_MATH;
+
+  arm_scale_q31(buf, gain, postShift, buf, nSamples);
+  return RES_OK;
+}
+
+// *****************************************************************************
+static tErrorCode DSP_PlotMagnitude(tInstanceIIRf32 *instf32, double *hLinear, 
                                     tGeneralChannel channel)
 // *****************************************************************************
 // Description: Plots the magnitude response of the combination of all filters
@@ -342,18 +457,19 @@ static tErrorCode DSP_PlotMagnitude(tInstanceIIRf32 *instf32, float *hLinear,
 // Parameters: 
 //   *instf32: Pointer to the IIR floating point filters instance
 //   *hLinear: Pointer to the magnitude response vector in linear scale
-// Returns: error code
+// Returns: Error code
 // *****************************************************************************
 {
   if ((NULL == instf32) || (NULL == hLinear)) return RES_ERROR_PARAM;
-  float frPoints[PLOT_RESOLUTION];
-  float phi, dFreq, exp, *coeff, magnitude2; // Discrete frequency normalized to the unit circle
+  double frPoints[PLOT_RESOLUTION];
+  double phi, dFreq, exp, magnitude2;
+  float *coeff; // Discrete frequency normalized to the unit circle
   uint8_t i,j;
   
   // Initialize values with 0dB gain
   for (i = 0; i < PLOT_RESOLUTION; i++)
   {
-    hLinear[i] = (float)1;
+    hLinear[i] = (double)1;
   }
   
   // Compute frequency points in hertz and calculate amplitude for each one
@@ -386,47 +502,50 @@ static tErrorCode DSP_PlotMagnitude(tInstanceIIRf32 *instf32, float *hLinear,
 }
 
 // *****************************************************************************
-static tErrorCode DSP_UpdateNormGain(tGain *normGain, float *fResponse, 
+static tErrorCode DSP_UpdateNormGain(tGain *normGain, double *fResponse, 
                               uint8_t nPoints, tGeneralChannel channel)
 // *****************************************************************************
 // Description: Updates given normalization block with the needed gain 
 // adjustement to obtain a final magnitude response that peaks at 0 dB for
-// desired channel.
+// passed channel.
 // Parameters: 
 //   *normGain: Pointer to the normalization gain array
 //   *fResponse: Pointer to the channel's magnitude response
-//   channel: channel of the given magnitude response
-// Returns: error code
+//   channel: Channel of the given magnitude response
+// Returns: Error code
 // *****************************************************************************
 {
   if ((NULL == normGain) || (NULL == fResponse)) return RES_ERROR_PARAM;
 
   uint8_t i;
-  float maxValue = 0;
-  float inversef32 = 0;
+  double maxValue = 0;
+  double inversef32 = 0;
   int16_t inverseq15 = 0;
+  int32_t inverseq31 = 0;
   while (0 < nPoints--)
   {
-    if (maxValue < *fResponse) maxValue = *fResponse++;
+    if (maxValue < *fResponse++) maxValue = *fResponse; // Get FR amplitude peak
   }
 
-  inversef32 = 1 / maxValue; // Get inverse gain
+  inversef32 = 1.0 / maxValue; // Get inverse gain
   
   if (1 < inversef32) 
   {
     inverseq15 = (int16_t)(inversef32 * SHRT_MAX/2);
+    inverseq31 = (int32_t)(inversef32 * LONG_MAX/2);
     normGain->postShift = 1;
   }
   else if (0 < inversef32) 
   {
     inverseq15 = (int16_t)(inversef32 * SHRT_MAX);
+    inverseq31 = (int32_t)(inversef32 * LONG_MAX);
     normGain->postShift = 0;
   }
   else return RES_ERROR_MATH;
 
-  
   normGain->f32 = inversef32;
   normGain->q15 = inverseq15; 
+  normGain->q31 = inverseq31; 
   return RES_OK;
 }
 
@@ -444,10 +563,15 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
 // received from master. Adapted to work with CMSIS-DSP filters from 
 // Audio EQ Cookbook, by Robert Bristow-Johnson. Updates normalization gain.
 // Parameters: 
-//   *pCfg: pointer to the structure containing design parameters
-//   *inst: pointer to the structure containing array for coefficients
-//   *s: pointer to the structure containing pointers for CMSIS-DSP filters
-// Returns: 
+//   *pCfg: Pointer to the structure containing design parameters
+//   *instf32: pointer to the f32 structure containing array for coefficients
+//   *instq15: Pointer to the q15 structure containing array for coefficients
+//   *instq31: Pointer to the q31 structure containing array for coefficients
+//   *s: Pointer to the f32 structure containing pointers for CMSIS-DSP filters
+//   *q: Pointer to the q15 structure containing pointers for CMSIS-DSP filters
+//   *r: Pointer to the q31 structure containing pointers for CMSIS-DSP filters
+//   *normGain: Pointer to the normalization gain array
+// Returns: Error code 
 // *****************************************************************************
 {
   if ((NULL == pCfg) || (NULL == s) || (NULL == instf32) || (NULL == instq15)) 
@@ -465,63 +589,63 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
     w0 = 2 * PI * pCfg->freq / SAMPLE_RATE;
     a = sin(w0) / (2 * pCfg->q);
     A =  pow(10.0,(double)(pCfg->gain/40));
-	  a0 = 0;
+    a0 = 0;
     coeff = instf32->coeffs; // Pointer to filter coefficient array
 
     switch (pCfg->type)
-	  {
+    {
   
-	    case LOWPASS: 
-	            a0 =                  1 + a;
-	  	  coeff[3] =     (2 * cos(w0)) / a0;  // a1
-	  	  coeff[4] =         - (1 - a) / a0;  // a2
-        coeff[0] = ((1 - cos(w0))/2) / a0;  // b0
-	  	  coeff[1] =           2 * coeff[0];  // b1
-	  	  coeff[2] =               coeff[0];  // b2
-	  	break;
-  
-	    case HIGHPASS:
+      case LOWPASS: 
               a0 =                  1 + a;
-	      coeff[3] =  - (-2 * cos(w0)) / a0;  // a1
-	      coeff[4] =         - (1 - a) / a0;  // a2
+        coeff[3] =     (2 * cos(w0)) / a0;  // a1
+        coeff[4] =         - (1 - a) / a0;  // a2
+        coeff[0] = ((1 - cos(w0))/2) / a0;  // b0
+        coeff[1] =           2 * coeff[0];  // b1
+        coeff[2] =               coeff[0];  // b2
+      break;
+  
+      case HIGHPASS:
+              a0 =                  1 + a;
+        coeff[3] =  - (-2 * cos(w0)) / a0;  // a1
+        coeff[4] =         - (1 - a) / a0;  // a2
         coeff[0] = ((1 + cos(w0))/2) / a0;  // b0
-	      coeff[1] =          -2 * coeff[0];  // b1
-	      coeff[2] =               coeff[0];  // b2
-	  	break;
+        coeff[1] =          -2 * coeff[0];  // b1
+        coeff[2] =               coeff[0];  // b2
+      break;
   
-	    case PEAK:
-	            a0 =           1 + (a / A);
-	  	  coeff[3] = - (-2 * cos(w0)) / a0;  // a1
-	  	  coeff[4] =  - (1 - (a / A)) / a0;  // a2
+      case PEAK:
+              a0 =           1 + (a / A);
+        coeff[3] = - (-2 * cos(w0)) / a0;  // a1
+        coeff[4] =  - (1 - (a / A)) / a0;  // a2
         coeff[0] =    (1 + (a * A)) / a0;  // b0
-	  	  coeff[1] =            - coeff[3];  // b1
-	  	  coeff[2] =    (1 - (a * A)) / a0;  // b2
+        coeff[1] =            - coeff[3];  // b1
+        coeff[2] =    (1 - (a * A)) / a0;  // b2
       break;
   
-	    case LOWSHELF:
-	            a0 =            (1 + A) + (A - 1) * cos(w0) + 2 * a * sqrt(A);
-	  	  coeff[3] =                   2 * ((A - 1) + (A + 1) * cos(w0)) / a0;
-	  	  coeff[4] =   - ((1 + A) + (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;        
-        coeff[0] = A * ((A + 1) - (A - 1) * cos(w0) + 2 * sqrt(A) * a) / a0;
-	  	  coeff[1] =               2 * A * ((A - 1) - (A + 1) * cos(w0)) / a0;
-	  	  coeff[2] = A * ((A + 1) - (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0;
+      case LOWSHELF:
+              a0 =            (1 + A) + (A - 1) * cos(w0) + 2 * a * sqrt(A); 
+        coeff[3] =                   2 * ((A - 1) + (A + 1) * cos(w0)) / a0; 
+        coeff[4] =   - ((1 + A) + (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;         
+        coeff[0] = A * ((A + 1) - (A - 1) * cos(w0) + 2 * sqrt(A) * a) / a0; 
+        coeff[1] =               2 * A * ((A - 1) - (A + 1) * cos(w0)) / a0; 
+        coeff[2] = A * ((A + 1) - (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0; 
       break;
   
-	    case HIGHSHELF:
-	      	    a0 =            (1 + A) - (A - 1) * cos(w0) + 2 * a * sqrt(A);
-	  	  coeff[3] =                  -2 * ((A - 1) - (A + 1) * cos(w0)) / a0;
-	  	  coeff[4] =   - ((1 + A) - (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;
+      case HIGHSHELF:
+              a0 =            (1 + A) - (A - 1) * cos(w0) + 2 * a * sqrt(A);
+        coeff[3] =                  -2 * ((A - 1) - (A + 1) * cos(w0)) / a0;
+        coeff[4] =   - ((1 + A) - (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;
         coeff[0] = A * ((A + 1) + (A - 1) * cos(w0) + 2 * sqrt(A) * a) / a0;
-	  	  coeff[1] =             - 2 * A * ((A - 1) + (A + 1) * cos(w0)) / a0;
-	  	  coeff[2] = A * ((A + 1) + (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0;
+        coeff[1] =             - 2 * A * ((A - 1) + (A + 1) * cos(w0)) / a0;
+        coeff[2] = A * ((A + 1) + (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0;
       break;
   
-	    default:
-	      return RES_ERROR_PARAM;
-	  }
-
-    #ifdef USE_LIBRARY
-	  arm_biquad_cascade_df2T_init_f32(s, 1, instf32->coeffs, instf32->delays);
+      default:
+        return RES_ERROR_PARAM;
+    }
+    
+    // Set CMSIS-DSP library instances
+    arm_biquad_cascade_df2T_init_f32(s, 1, instf32->coeffs, instf32->delays);
 
     // Compute fixed-point coefficients
     if ((coeff[0] > 1) || (coeff[1] > 1) || (coeff[2] > 1) || (coeff[3] > 1) ||
@@ -533,14 +657,16 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
      instq15->coeffs[3] = (int16_t)(coeff[2] * SHRT_MAX/2);
      instq15->coeffs[4] = (int16_t)(coeff[3] * SHRT_MAX/2);
      instq15->coeffs[5] = (int16_t)(coeff[4] * SHRT_MAX/2);
-      arm_biquad_cascade_df1_init_q15(q, 1, instq15->coeffs, instq15->delays, 1);
+     instq15->postShift = 1;
+     arm_biquad_cascade_df1_init_q15(q, 1, instq15->coeffs, instq15->delays, 1);
      
-     instq31->coeffs[0] = (int32_t)(coeff[0] * INT_MAX/2);
-     instq31->coeffs[2] = (int32_t)(coeff[1] * INT_MAX/2);
-     instq31->coeffs[3] = (int32_t)(coeff[2] * INT_MAX/2);
-     instq31->coeffs[4] = (int32_t)(coeff[3] * INT_MAX/2);
-     instq31->coeffs[5] = (int32_t)(coeff[4] * INT_MAX/2);
-      arm_biquad_cascade_df1_init_q31(r, 1, instq31->coeffs, instq31->delays, 1);
+     instq31->coeffs[0] = (int32_t)(coeff[0] * LONG_MAX/2);
+     instq31->coeffs[1] = (int32_t)(coeff[1] * LONG_MAX/2);
+     instq31->coeffs[2] = (int32_t)(coeff[2] * LONG_MAX/2);
+     instq31->coeffs[3] = (int32_t)(coeff[3] * LONG_MAX/2);
+     instq31->coeffs[4] = (int32_t)(coeff[4] * LONG_MAX/2);
+     instq31->postShift = 1;
+     arm_biquad_cascade_df1_init_q31(r, 1, instq31->coeffs, instq31->delays, 1);
     }
     else 
     {
@@ -549,16 +675,18 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
      instq15->coeffs[2] = (int16_t)(coeff[2] * SHRT_MAX);
      instq15->coeffs[3] = (int16_t)(coeff[3] * SHRT_MAX);
      instq15->coeffs[4] = (int16_t)(coeff[4] * SHRT_MAX);
+     instq15->postShift = 0;
      arm_biquad_cascade_df1_init_q15(q, 1, instq15->coeffs, instq15->delays, 0);
      
-     instq31->coeffs[0] = (int32_t)(coeff[0] * INT_MAX);
-     instq31->coeffs[1] = (int32_t)(coeff[1] * INT_MAX);
-     instq31->coeffs[2] = (int32_t)(coeff[2] * INT_MAX);
-     instq31->coeffs[3] = (int32_t)(coeff[3] * INT_MAX);
-     instq31->coeffs[4] = (int32_t)(coeff[4] * INT_MAX);
+     instq31->coeffs[0] = (int32_t)(coeff[0] * LONG_MAX);
+     instq31->coeffs[1] = (int32_t)(coeff[1] * LONG_MAX);
+     instq31->coeffs[2] = (int32_t)(coeff[2] * LONG_MAX);
+     instq31->coeffs[3] = (int32_t)(coeff[3] * LONG_MAX);
+     instq31->coeffs[4] = (int32_t)(coeff[4] * LONG_MAX);
+     instq31->postShift = 0;
      arm_biquad_cascade_df1_init_q31(r, 1, instq31->coeffs, instq31->delays, 0);
     }
-    #endif
+    
 
     // Assign filter channel to instances
     instf32->channel = pCfg->channel;
@@ -567,17 +695,17 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
 
     instq15++;
     instq31++;
-	  instf32++;
+    instf32++;
     q++;
     r++;
-	  s++;
-	  pCfg++;
+    s++;
+    pCfg++;
   }
 
   instq15 -= MAX_FILTERS;
   instf32 -= MAX_FILTERS;
   
-  float fResponse[PLOT_RESOLUTION];  // Store frequency response temporarily
+  double fResponse[PLOT_RESOLUTION];  // Store frequency response temporarily
   uint8_t j;
   for (j = CHANNEL_0; j < MAX_CHANNELS; j++)
   {
@@ -595,32 +723,44 @@ void DSP_TestFilters(tParamConfig *pCfg)
 // Description: Set filter parameters for testing purposes
 // Parameters: 
 //   *pCfg: Pointer to structure containing filter parameters
-// Returns: nothing
+// Returns: Nothing
 // *****************************************************************************
 {
-  pCfg->freq =  12000;
+  pCfg->freq =  1000;
   pCfg->q =  0.707;
-  pCfg->gain =  2;
-  pCfg->type =  HIGHSHELF;
+  pCfg->gain =  0;
+  pCfg->type =  HIGHPASS;
   pCfg->channel =  CHANNEL_0;
   pCfg++;
-  pCfg->freq =   12000;
+  pCfg->freq =  1000;
   pCfg->q =  0.707;
-  pCfg->gain =  2;
-  pCfg->type =  HIGHSHELF;
+  pCfg->gain =  0;
+  pCfg->type =  HIGHPASS;
   pCfg->channel =  CHANNEL_1;
   pCfg++;
   pCfg->freq =  200;
-  pCfg->q =  0.707;
-  pCfg->gain =  6;
+  pCfg->q =  2;
+  pCfg->gain =  15;
   pCfg->type =  PEAK;
   pCfg->channel =  CHANNEL_0;
   pCfg++;
   pCfg->freq =  200;
-  pCfg->q =  0.707;
-  pCfg->gain = 6;
+  pCfg->q =  2;
+  pCfg->gain = 15;
   pCfg->type =  PEAK;
   pCfg->channel =  CHANNEL_1;
+  // pCfg++;
+  // pCfg->freq =  200;
+  // pCfg->q =  2;
+  // pCfg->gain =  8;
+  // pCfg->type =  PEAK;
+  // pCfg->channel =  CHANNEL_0;
+  // pCfg++;
+  // pCfg->freq =  200;
+  // pCfg->q =  2;
+  // pCfg->gain = 8;
+  // pCfg->type =  PEAK;
+  // pCfg->channel =  CHANNEL_1;
 }
 
 // *****************************************************************************
@@ -634,7 +774,7 @@ void DSP_Init(tParamConfig *pCfg, tInstanceIIRf32 *instf32,
 // *****************************************************************************
 {
   uint8_t i;
-	
+  
   for (i = 0; i<MAX_FILTERS; i++)
   {
     instf32->delays[0] = 0;
@@ -645,7 +785,7 @@ void DSP_Init(tParamConfig *pCfg, tInstanceIIRf32 *instf32,
     instf32->coeffs[2] = 0;
     instf32->coeffs[3] = 0;
     instf32->coeffs[4] = 0;
-  	instf32->channel = CHANNEL_NONE;
+    instf32->channel = CHANNEL_NONE;
     arm_biquad_cascade_df2T_init_f32(s, 1, instf32->coeffs, instf32->delays);
 
     instq15->delays[0] = 0;
@@ -659,10 +799,10 @@ void DSP_Init(tParamConfig *pCfg, tInstanceIIRf32 *instf32,
     instq15->coeffs[3] = 0;
     instq15->coeffs[4] = 0;
     instq15->coeffs[5] = 0;
-  	instq15->channel = CHANNEL_NONE;
+    instq15->channel = CHANNEL_NONE;
     arm_biquad_cascade_df1_init_q15(q, 1, instq15->coeffs, instq15->delays, 0); 
 
-  	pCfg->channel = CHANNEL_NONE;
+    pCfg->channel = CHANNEL_NONE;
     pCfg->gain = 0;
 
     instf32++;
