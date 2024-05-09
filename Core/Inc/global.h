@@ -10,9 +10,28 @@
 #include <stdint.h>
 // *****************************************************************************
 // Defines 
+#define GLOBAL_H
 
 // *****************************************************************************
 // Variables 
+
+typedef enum
+{
+  TYPE_INT8_T,
+  TYPE_INT16_T,
+  TYPE_INT32_T,
+  TYPE_INT64_T,
+  TYPE_UINT8_T,
+  TYPE_UINT16_T,
+  TYPE_UINT32_T,
+  TYPE_UINT64_T,
+  TYPE_FLOAT,
+  TYPE_DOUBLE,
+  TYPE_CHAR,
+  TYPE_STRING,
+  TYPE_VOID
+} tDataType;
+
 typedef enum
 {
   RES_OK            = 0,

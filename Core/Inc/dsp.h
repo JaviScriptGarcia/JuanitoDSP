@@ -7,26 +7,29 @@
 // Includes
 #include <stdio.h>
 #include <stdint.h>
+#ifndef _ARM_MATH_H
 #include <arm_math.h>
-#include <math.h>
+#endif
+#ifndef GLOBAL_H
 #include "global.h"
-
+#endif
 
 // *****************************************************************************
 // Defines 
-#ifndef __FPU_PRESENT
-#define __FPU_PRESENT
-#endif
+#define DSP_H
 
-// Global system configuration
-#define BUFFER_SIZE  512
+// Global DSP system configuration
+#define BUFFER_SIZE  2048 // Must be even and +2 times greater than largest IR
+#define MAX_FILTERS  8
+#define FIR_MAX_SIZE 256
+#define SAMPLE_RATE  48000
+
+// Hardware configuration
 #define DAC_QUANTITY 1
 #define ADC_QUANTITY 1
 #define MAX_CHANNELS 4
-#define MAX_FILTERS  8
-#define SAMPLE_RATE  48000
 
-// Configure which filtering functions will be used
+// Configure processing algorithm method
 #define USE_LIBRARY  // Use CMSIS-DSP library functions if defined
 
 // *****************************************************************************
@@ -47,12 +50,22 @@ typedef enum
 
 typedef enum
 {
-  LOWPASS   = 0,
-  HIGHPASS  = 1,
-  PEAK      = 2,
-  LOWSHELF  = 3,
-  HIGHSHELF = 4
+  IIRLOWPASS   = 0,
+  IIRHIGHPASS  = 1,
+  IIRPEAK      = 2,
+  IIRLOWSHELF  = 3,
+  IIRHIGHSHELF = 4,
+  FIRLOWPASS = 5,
+  FIRHIGHPASS = 6
 } tTypeIIR;
+
+typedef struct
+{
+  float coeffs[FIR_MAX_SIZE];
+  float delays[FIR_MAX_SIZE + BUFFER_SIZE/2 -1];
+  uint16_t size;
+  tGeneralChannel channel;
+} tInstanceFIRf32;
 
 typedef struct // Direct form II
 {
@@ -95,7 +108,12 @@ typedef struct
 // *****************************************************************************
 // Functions 
 
-// Filters
+// FIR Filters
+tErrorCode DSP_FIR_f32(float *buf, uint16_t nSamples, tInstanceFIRf32 *inst);
+tErrorCode DSP_FIR_f32_arm(float *buf, uint16_t nSamples, 
+                           arm_fir_instance_f32 *f);
+
+// IIR Filters
 tErrorCode DSP_IIR_f32(float *buf, uint32_t nSamples, tInstanceIIRf32 *inst);
 tErrorCode DSP_IIR_q15(int16_t *buf, uint32_t nSamples, tInstanceIIRq15 *inst);
 tErrorCode DSP_IIR_q31(int32_t *buf, uint32_t nSamples, tInstanceIIRq31 *inst);
@@ -115,6 +133,7 @@ tErrorCode DSP_Gain_q31_arm(int32_t *buf, int32_t gain, int8_t postShift,
 
 // Arithmetic conversion
 tErrorCode DSP_q15_to_f32_arm(int16_t *inBuf, float *outBuf, uint32_t nSamples);
+tErrorCode DSP_q31_to_f32_arm(int32_t *inBuf, float *outBuf, uint32_t nSamples);
 tErrorCode DSP_f32_to_q15_arm(float *inBuf, int16_t *outBuf, uint32_t nSamples);
 tErrorCode DSP_q31_to_q15_arm(int32_t *inBuf, int16_t *outBuf, 
                               uint32_t nSamples);
@@ -130,6 +149,9 @@ tErrorCode DSP_EncodePCM(int16_t *outBuf, int16_t *bufL, int16_t *bufR,
                                uint32_t nSamples);
 
 // Coefficient computation
+tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tInstanceFIRf32 *instf32,
+                                  arm_fir_instance_f32 *f, uint16_t nSamples);
+
 tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg, 
                                   tInstanceIIRf32 *instf32,
                                   tInstanceIIRq15 *instq15,
@@ -140,8 +162,11 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
                                   tGain *normGain);
 
 // Others
+tErrorCode DSP_CheckConfig(uint16_t bufSize, tInstanceFIRf32 *instf32, 
+                           uint16_t nAdc, uint16_t nDac);
 void DSP_TestFilters(tParamConfig *pCfg);
-void DSP_Init(tParamConfig *pCfg, tInstanceIIRf32 *instf32, 
-              tInstanceIIRq15 *instq15, arm_biquad_cascade_df2T_instance_f32 *s,
+void DSP_Init(tParamConfig *pCfg, tInstanceFIRf32 *instFIRf32, 
+              tInstanceIIRf32 *instf32, tInstanceIIRq15 *instq15, 
+              arm_biquad_cascade_df2T_instance_f32 *s,
               arm_biquad_casd_df1_inst_q15 *q, tGain *staticGain);
 
