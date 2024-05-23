@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #ifndef DSP_H
 #include "dsp.h"
 #endif
@@ -77,8 +78,6 @@ typedef enum
   Q31
 } tArithmetic;
 
-
-
 // *****************************************************************************
 // INPUT, OUTPUT AND PROCESSING BUFFERS
 static uint32_t adc[BUFFER_SIZE*2];                  //  RX buffer (Stereo PCM)
@@ -87,37 +86,45 @@ static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE]; //  Processing buffers
 // *****************************************************************************
 
 // *****************************************************************************
-// FIR instances
-static tInstanceFIRf32 insFIRf32[MAX_FILTERS];
+// Convolution instances
+static tConvq15 convq15[MAX_CONV];
 // *****************************************************************************
 
 // *****************************************************************************
+// FIR instances
+static tFIRf32 FIRf32[MAX_FILTERS];
+static tFIRq15 FIRq15[MAX_FILTERS];
+
 // FIR arm_math.h instances
-static arm_fir_instance_f32 insLibFIRf32[MAX_FILTERS];
+static arm_fir_instance_f32 insFIRf32[MAX_FILTERS];
+static arm_fir_instance_q15 insFIRq15[MAX_FILTERS];
 // *****************************************************************************
 
 // *****************************************************************************
 // IIR 2nd order biquads
-static tInstanceIIRf32 insIIRf32[MAX_FILTERS];  // IIR 2nd order instance
-static tInstanceIIRq15 insIIRq15[MAX_FILTERS];  // IIR 2nd order instance
-static tInstanceIIRq31 insIIRq31[MAX_FILTERS];  // IIR 2nd order instance
-static tParamConfig pCfg2ndIIR[MAX_FILTERS]; // IIR 2nd order config parameters
+static tIIRf32 IIRf32[MAX_FILTERS];    // IIR 2nd order instance
+static tIIRq15 IIRq15[MAX_FILTERS];    // IIR 2nd order instance
+static tIIRq31 IIRq31[MAX_FILTERS];    // IIR 2nd order instance
+static tParamConfig filterConfig[MAX_FILTERS]; // IIR 2nd order config params
 static tGain normGain[MAX_CHANNELS]; // Anti saturation pre-filter gain
-// *****************************************************************************
 
-// *****************************************************************************
 // IIR arm_math.h 2nd order biquads pointer instance
-static arm_biquad_cascade_df2T_instance_f32 insLibIIRf32[MAX_FILTERS];
-static arm_biquad_casd_df1_inst_q15 insLibIIRq15[MAX_FILTERS];
-static arm_biquad_casd_df1_inst_q31 insLibIIRq31[MAX_FILTERS];
+static arm_biquad_cascade_df2T_instance_f32 insIIRf32[MAX_FILTERS];
+static arm_biquad_casd_df1_inst_q15 insIIRq15[MAX_FILTERS];
+static arm_biquad_casd_df1_inst_q31 insIIRq31[MAX_FILTERS];
 // *****************************************************************************
 
 // *****************************************************************************
 // APP LOGIC STATE VARIABLES
 static tErrorCode appError;
 static uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
+static uint8_t filterConfigFlag = 0; // 0 = configured, 1 = new config received
 static uint32_t timerCount = 0;   // Performance monitor timer
 static float cpuUsage = 0;        // CPU real-time usage (%)
+uint16_t nSamples = BUF_HALF;
+uint16_t bufSize = BUFFER_SIZE;
+
+
 // *****************************************************************************
 
 /* USER CODE END PV */
@@ -131,7 +138,10 @@ static void MX_TIM3_Init(void);
 static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
 /* USER CODE BEGIN PFP */
+static void AppInit(void);
+static tErrorCode CheckParams(void);
 static tErrorCode ProcessData(void);
+static tErrorCode CheckConfig(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -163,20 +173,21 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  DSP_Init(pCfg2ndIIR, insFIRf32, insIIRf32, insIIRq15, insLibIIRf32, 
-           insLibIIRq15, normGain);
-  DSP_TestFilters(pCfg2ndIIR);
+  AppInit();
+  DSP_TestFilters(filterConfig);
   
-  if (RES_OK != DSP_UpdateIIRInstances(pCfg2ndIIR, insIIRf32, insIIRq15, 
-                insIIRq31, insLibIIRf32, insLibIIRq15, insLibIIRq31, normGain))
+  if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
+  insIIRf32, insIIRq15, insIIRq31, normGain))
   {appError = ERROR_CODE_15; goto error;}
 
-  if (RES_OK != DSP_UpdateFIRInstances(pCfg2ndIIR, insFIRf32, insLibFIRf32, 
-                                       BUF_HALF))
+  if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
+                insFIRq15))
   {appError = ERROR_CODE_16; goto error;}
 
-  if (RES_OK != DSP_CheckConfig(BUFFER_SIZE, insFIRf32, ADC_QUANTITY, 
-                DAC_QUANTITY))
+  if (RES_OK != DSP_UpdateConvolutionInstances(convq15))
+  {appError = ERROR_CODE_16; goto error;}
+
+  if (RES_OK != CheckParams())
   {appError = ERROR_CODE_17; goto error;}
   /* USER CODE END SysInit */
 
@@ -188,18 +199,18 @@ int main(void)
   MX_I2S2_Init();
   MX_I2S3_Init();
   /* USER CODE BEGIN 2 */
-    HAL_TIM_Base_Start_IT(&htim16); // TIENE QUE ESTAR EN MODO IT (_IT al final) PARA PODER ARRANCAR EN MODO INTERRUPCION Y QUE EJECUTE LA RUTINA
-    HAL_TIM_Base_Start_IT(&htim3);  //
+    HAL_TIM_Base_Start_IT(&htim16);
+    HAL_TIM_Base_Start_IT(&htim3);
 
-    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac, BUFFER_SIZE*2);
-    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc, BUFFER_SIZE*2);
-
+    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac, BUFFER_SIZE * 2);
+    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc, BUFFER_SIZE * 2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     while (1)
     {
+      if (RES_OK != CheckConfig()) goto error;
       if (RES_OK != ProcessData()) goto error;
     }
     /* USER CODE END WHILE */
@@ -635,7 +646,73 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 }
 
 // *****************************************************************************
-static tErrorCode NormalizeChannels(void *inBuf, tGain *gain, uint32_t nSamples,
+static void AppInit(void)
+// *****************************************************************************
+// Description: Initializes structure values with 0
+// Parameters: none
+// Returns: nothing
+// *****************************************************************************
+{
+  uint16_t i, j;
+  
+  for (i = 0; i<MAX_FILTERS; i++)
+  {
+    // Init delayed samples for f32
+    for (j = 0; j < 2; j++) IIRf32[i].delays[j] = 0;
+    // Init biquad coeffs for f32
+    for (j = 0; j < 5; j++) IIRf32[i].coeffs[j] = 0;
+    arm_biquad_cascade_df2T_init_f32(insIIRf32, 1, IIRf32[i].coeffs, 
+                                     IIRf32[i].delays);
+
+    // Init delayed samples for q15
+    for (j = 0; j < 4; j++) IIRq15[i].delays[j] = 0;
+    // Init biquad coeffs for q15
+    for (j = 0; j < 6; j++) IIRq15[i].coeffs[j] = 0;
+    arm_biquad_cascade_df1_init_q15(insIIRq15, 1, IIRq15[i].coeffs, 
+                                    IIRq15[i].delays, 0); 
+
+    // Init delayed samples for q31
+    for (j = 0; j < 4; j++) IIRq31[i].delays[j] = 0;
+    // Init biquad coeffs for q31
+    for (j = 0; j < 5; j++) IIRq31[i].coeffs[j] = 0;
+    arm_biquad_cascade_df1_init_q31(insIIRq31, 1, IIRq31[i].coeffs, 
+                                    IIRq31[i].delays, 0); 
+
+    // Init channel routing
+    IIRf32[i].channel = CHANNEL_NONE;
+    IIRq15[i].channel = CHANNEL_NONE;
+    IIRq15[i].channel = CHANNEL_NONE;
+    FIRf32[i].channel = CHANNEL_NONE;
+    FIRq15[i].channel = CHANNEL_NONE;
+
+    filterConfig[i].channel = CHANNEL_NONE;
+    filterConfig[i].gain = 0;
+    normGain[i].f32 = 0;
+    normGain[i].q31 = 0;
+    normGain[i].q15 = 0;
+  }
+
+  // Init convolution channels
+  for (i = 0; i < MAX_CONV; i++) convq15[i].channel = CHANNEL_NONE;
+}
+
+// *****************************************************************************
+static tErrorCode CheckParams(void)
+// *****************************************************************************
+// Description: Checks system configuration to ensure compatibility
+// Parameters: None.
+// Returns: Error code.
+// *****************************************************************************
+{
+  if ((4 < DAC_QUANTITY) || (0 > DAC_QUANTITY)) return RES_ERROR_PARAM;
+  if ((4 < ADC_QUANTITY) || (0 > ADC_QUANTITY)) return RES_ERROR_PARAM;
+  if (0 != (BUFFER_SIZE % 4)) return RES_ERROR_PARAM; // Must be a multiple of 4
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+static tErrorCode NormalizeChannels(void *inBuf, tGain *gain, 
                                     tArithmetic bufType)
 // *****************************************************************************
 // Description: Normalizes all channels with their corresponding gain to avoid
@@ -648,18 +725,18 @@ static tErrorCode NormalizeChannels(void *inBuf, tGain *gain, uint32_t nSamples,
   {appError = ERROR_CODE_12; return RES_ERROR_PARAM;}
 
   uint8_t i;
-  uint16_t chanLength = 2*nSamples;
   size_t sizeDif = 0;
+
   switch (bufType)
   {
     case Q15:
       sizeDif = sizeof(int32_t)/sizeof(int16_t);
       for(i = CHANNEL_0; i < MAX_CHANNELS; i++)
       {
-        if (RES_OK != DSP_Gain_q15_arm((int16_t *)inBuf + (i * chanLength) 
+        if (SHRT_MAX == gain->q15) break;
+        if (RES_OK != DSP_Gain_q15_arm((int16_t *)inBuf + (bufSize * i) 
                       * sizeDif, gain->q15, gain->postShift, nSamples))
         {appError = ERROR_CODE_13; return RES_ERROR;}
-        gain++;
       }
       break;
     
@@ -667,21 +744,21 @@ static tErrorCode NormalizeChannels(void *inBuf, tGain *gain, uint32_t nSamples,
       sizeDif = sizeof(int32_t)/sizeof(int32_t);
       for(i = CHANNEL_0; i < MAX_CHANNELS; i++)
       {
-        if (RES_OK != DSP_Gain_q31_arm((int32_t *)inBuf + (i * chanLength) 
+        if (LONG_MAX == gain->q31) break;
+        if (RES_OK != DSP_Gain_q31_arm((int32_t *)inBuf + (bufSize * i) 
                       * sizeDif, gain->q31, gain->postShift, nSamples))
         {appError = ERROR_CODE_13; return RES_ERROR;}
-        gain++;
       }
       break;
     
     case F32:
+      if ((float)1 == gain->f32) break;
       sizeDif = sizeof(int32_t)/sizeof(float);
       for(i = CHANNEL_0; i < MAX_CHANNELS; i++)
       {
-        if (RES_OK != DSP_Gain_f32_arm((float *)inBuf + (i * chanLength) 
+        if (RES_OK != DSP_Gain_f32_arm((float *)inBuf + (bufSize * i) 
                       * sizeDif, gain->f32, nSamples))
         {appError = ERROR_CODE_13; return RES_ERROR;}
-        gain++;
       }
       break;
 
@@ -689,67 +766,83 @@ static tErrorCode NormalizeChannels(void *inBuf, tGain *gain, uint32_t nSamples,
       appError = ERROR_CODE_12; 
       return RES_ERROR_PARAM;
       break;
+
+    gain++;
   }
 
   return RES_OK;
 }
 
 // *****************************************************************************
-static tErrorCode ApplyFilters(void *inBuf, tInstanceFIRf32 *instFIRf32, 
-                               arm_fir_instance_f32 *f,
-                               tInstanceIIRf32 *instf32, 
-                               tInstanceIIRq15 *instq15, 
-                               tInstanceIIRq31 *instq31,
+static tErrorCode ApplyFilters(void *inBuf, tFIRf32 *pFIRf32, tFIRq15 *pFIRq15, 
+                               arm_fir_instance_f32 *f, arm_fir_instance_q15 *g,
+                               tIIRf32 *pIIRf32, 
+                               tIIRq15 *pIIRq15, 
+                               tIIRq31 *pIIRq31,
                                arm_biquad_cascade_df2T_instance_f32 *s,
                                arm_biquad_casd_df1_inst_q15 *q, 
                                arm_biquad_casd_df1_inst_q31 *r,
-                               uint32_t nSamples,
                                tArithmetic bufType)
 // *****************************************************************************
 // Description: Processes multiple channels with desired filters and desired
 // arithmetic.
 // Parameters: 
 //   *inBuf: Pointer to the buffer storing all channels
-//   *instf32: Pointer to the F32 IIR filter instance
-//   *instq15: Pointer to the Q15 IIR filter instance
-//   *inst131: Pointer to the Q31 IIR filter instance
-//   *s: Pointer to the F32 IIR arm_math filter instance
-//   *q: Pointer to the Q15 IIR arm_math filter instance
-//   *r: Pointer to the Q31 IIR arm_math filter instance
+//   *pIIRf32: Pointer to the F32 IIR filters
+//   *pIIRq15: Pointer to the Q15 IIR filters
+//   *inst131: Pointer to the Q31 IIR filters
+//   *s: Pointer to the F32 IIR arm_math filter instances
+//   *q: Pointer to the Q15 IIR arm_math filter instances
+//   *r: Pointer to the Q31 IIR arm_math filter instances
 //   nSamples: Number of array positions to be filtered
 //   bufType: Type of aritmethic to use, must match the channel variable type
 // Returns: error code
 // *****************************************************************************
 {
-  if ((NULL == instf32) || (NULL == instq15) || (NULL == instq31) ||
+  if ((NULL == pIIRf32) || (NULL == pIIRq15) || (NULL == pIIRq31) ||
       (NULL == inBuf)) 
   {appError = ERROR_CODE_9; return RES_ERROR_PARAM;}
   
   uint8_t i;
   uint16_t filterChan = 0;
-  uint16_t chanLength = nSamples*2;
-  size_t sizeDif = 0; // Difference between used and largest union member size
+  size_t sizeDif = 0; // Difference between largest and used union member size
+
   switch (bufType)
   {
     case Q15:
       sizeDif = sizeof(int32_t)/sizeof(int16_t);
       for (i = CHANNEL_0; i < MAX_FILTERS; i++)
       {
-        if (CHANNEL_NONE != instq15->channel)
+        if (CHANNEL_NONE != pIIRq15->channel)
         {
-          filterChan = instq15->channel;
+          filterChan = pIIRq15->channel;
           #ifdef USE_LIBRARY
           if (RES_OK != DSP_IIR_q15_arm((int16_t *)inBuf + 
-                        (filterChan * chanLength) * sizeDif, nSamples, q))
+                        (filterChan * bufSize) * sizeDif, nSamples, q))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #else
           if (RES_OK != DSP_IIR_q15((int16_t *)inBuf + 
-                        (filterChan * chanLength) * sizeDif, nSamples, instq15))
+                        (filterChan * bufSize) * sizeDif, nSamples, pIIRq15))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #endif
         }
+        if (CHANNEL_NONE != pFIRq15->channel)
+        {
+          filterChan = pFIRq15->channel;
+          #ifdef USE_LIBRARY
+          if (RES_OK != DSP_FIR_q15_arm((int16_t *)inBuf + 
+                        (filterChan * bufSize) * sizeDif, nSamples, g))
+          {appError = ERROR_CODE_10; return RES_ERROR;}
+          #else
+          if (RES_OK != DSP_FIR_q15((int16_t *)inBuf + 
+                        (filterChan * bufSize) * sizeDif, nSamples, pFIRq15))
+          {appError = ERROR_CODE_10; return RES_ERROR;}
+          #endif
+        }
+        pIIRq15++;
         q++;
-        instq15++;
+        pFIRq15++;
+        g++;
       }
       break;
 
@@ -757,21 +850,21 @@ static tErrorCode ApplyFilters(void *inBuf, tInstanceFIRf32 *instFIRf32,
       sizeDif = sizeof(int32_t)/sizeof(int32_t);
       for (i = 0; i < MAX_FILTERS; i++)
       {
-        if (CHANNEL_NONE != instq31->channel)
+        if (CHANNEL_NONE != pIIRq31->channel)
         {
-          filterChan = instq31->channel;
+          filterChan = pIIRq31->channel;
           #ifdef USE_LIBRARY
           if (RES_OK != DSP_IIR_q31_arm((int32_t *)inBuf + (filterChan *
-                        chanLength) * sizeDif, nSamples, r))
+                        bufSize) * sizeDif, nSamples, r))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #else
           if (RES_OK != DSP_IIR_q31((int32_t *)inBuf + 
-                        (filterChan * chanLength) * sizeDif, nSamples, instq31))
+                        (filterChan * bufSize) * sizeDif, nSamples, pIIRq31))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #endif
         }
         r++;
-        instq31++;
+        pIIRq31++;
       }
       break;
   
@@ -779,37 +872,37 @@ static tErrorCode ApplyFilters(void *inBuf, tInstanceFIRf32 *instFIRf32,
       sizeDif = sizeof(int32_t)/sizeof(float);
       for (i = 0; i < MAX_FILTERS; i++)
       {
-        if (CHANNEL_NONE != instf32->channel)
+        if (CHANNEL_NONE != pIIRf32->channel)
         {
-          filterChan = instf32->channel;
+          filterChan = pIIRf32->channel;
           #ifdef USE_LIBRARY
-          if (RES_OK != DSP_FIR_f32_arm((float *)inBuf + 
-                        (filterChan * chanLength) * sizeDif, nSamples, s))
+          if (RES_OK != DSP_IIR_f32_arm((float *)inBuf + 
+                        (filterChan * bufSize) * sizeDif, nSamples, s))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #else
-          if (RES_OK != DSP_IIR_f32((float *)inBuf + (filterChan * chanLength)
-                        * sizeDif, nSamples, instf32))
+          if (RES_OK != DSP_IIR_f32((float *)inBuf + (filterChan * bufSize)
+                        * sizeDif, nSamples, pIIRf32))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #endif
         }
-        if (CHANNEL_NONE != instFIRf32->channel)
+        if (CHANNEL_NONE != pFIRf32->channel)
         {
-          filterChan = instFIRf32->channel;
+          filterChan = pFIRf32->channel;
           #ifdef USE_LIBRARY
           if (RES_OK != DSP_FIR_f32_arm((float *)inBuf + 
-                        (filterChan * chanLength) * sizeDif, nSamples, f))
+                        (filterChan * bufSize) * sizeDif, nSamples, f))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #else
-          if (RES_OK != DSP_FIR_f32((float *)inBuf + (filterChan * chanLength)
-                        * sizeDif, nSamples, instFIRf32))
+          if (RES_OK != DSP_FIR_f32((float *)inBuf + (filterChan * bufSize)
+                        * sizeDif, nSamples, pFIRf32))
           {appError = ERROR_CODE_10; return RES_ERROR;}
           #endif
         }
 
         s++;
-        instf32++;
+        pIIRf32++;
         f++;
-        instFIRf32++;
+        pFIRf32++;
       }
       break;
     
@@ -819,13 +912,71 @@ static tErrorCode ApplyFilters(void *inBuf, tInstanceFIRf32 *instFIRf32,
       break;
   }
 
-  // Other filtering stages, FIR etc.
   return RES_OK;
+}
+
+
+// *****************************************************************************
+static tErrorCode ApplyConvolution(void *inBuf, tConvq15 *pConvq15, 
+                  tArithmetic bufType)
+// *****************************************************************************
+// Description: Applies convolution as configured.
+// Parameters: 
+//   *inBuf: Pointer to audio input signal.
+//   *pConvq15: Ponter to q15 convolution instance.
+//   nSamples: Number of samples to process.
+//   bufType: Type of arithmetic to be used.
+// Returns: Error code.
+// *****************************************************************************
+{
+  if ((NULL == pConvq15) || (NULL == inBuf)) 
+  {appError = ERROR_CODE_18; return RES_ERROR_PARAM;}
+  
+  uint8_t i;
+  uint16_t filterChan = 0;
+  size_t sizeDif = 0; // Difference between largest and used union member size
+
+  switch (bufType)
+  {
+    case Q15:
+      sizeDif = sizeof(int32_t)/sizeof(int16_t);
+      for (i = CHANNEL_0; i < MAX_CONV; i++)
+      {
+        if (CHANNEL_NONE != pConvq15->channel)
+        {
+          filterChan = pConvq15->channel;
+          #ifdef USE_LIBRARY
+          if (RES_OK != DSP_Convolution_q15_arm((int16_t *)inBuf + 
+                        (filterChan * bufSize) * sizeDif, nSamples, pConvq15))
+          {appError = ERROR_CODE_19; return RES_ERROR;}
+          #else
+          if (RES_OK != DSP_Convolution_q15((int16_t *)inBuf + 
+                        (filterChan * bufSize) * sizeDif, nSamples, pConvq15))
+          {appError = ERROR_CODE_10; return RES_ERROR;}
+          #endif
+        }
+        pConvq15++;
+      }
+      break;
+
+    case Q31:
+      break;
+  
+    case F32:
+      break;
+    
+    default: 
+      appError = ERROR_CODE_18; 
+      return RES_ERROR_PARAM;
+      break;
+  }
+  
+  return RES_OK;  
 }
 
 // *****************************************************************************
 static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR, 
-                             uint32_t nSamples, tArithmetic bufType)
+                             tArithmetic bufType)
 // *****************************************************************************
 // Description: Decodes a buffer of PCM data from the PCM1808 ADC
 // Parameters: 
@@ -837,14 +988,16 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
 // Returns: Error code
 // *****************************************************************************
 {
-  if ((2 > nSamples) || (NULL == inBuf) || 
-     (NULL == outBufL) || (NULL == outBufR)) 
+  if ((NULL == inBuf) || (NULL == outBufL) || (NULL == outBufR)) 
   {appError = ERROR_CODE_0; return RES_ERROR_PARAM;}
+
+  uint16_t nSamples = BUF_HALF;
+  uint16_t bufSize = BUFFER_SIZE;
 
   switch (bufType)
   {
     case Q15:
-      if (RES_OK != DSP_Int24ToInt16(inBuf, nSamples*2))
+      if (RES_OK != DSP_Int24ToInt16(inBuf, bufSize))
       {appError = ERROR_CODE_1; return RES_ERROR;}
     
       if (RES_OK != DSP_DecodePCM_Int16(inBuf, (int16_t *)outBufL, 
@@ -853,7 +1006,7 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
       break;
 
     case Q31:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, nSamples*2))
+      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
       {appError = ERROR_CODE_1; return RES_ERROR;}
     
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
@@ -862,7 +1015,7 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
       break;    
 
     case F32:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, nSamples*2))
+      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
       {appError = ERROR_CODE_1; return RES_ERROR;}
     
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
@@ -888,20 +1041,21 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
 
 // *****************************************************************************
 static tErrorCode EncodeData(void *inBufL, void *inBufR, int16_t *outBuf,
-                             uint32_t nSamples, tArithmetic bufType)
+                             tArithmetic bufType)
 // *****************************************************************************
 // Description: Decodes a buffer of PCM data to the PCM5102 DAC
 // Parameters: 
 //   *inBufL: Pointer to the buffer where the left channel data is stored
 //   *inBufR: Pointer to the buffer where the right channel data is stored
 //   *outBuf: Pointer to the buffer that will store stereo data for the DAC
-//   nSamples: Number of samples of one mono channel
 //   bufType: Type of arithmetic that will be used
 // Returns: Error code
 // *****************************************************************************
 {
-  if ((2 > nSamples) || (NULL == outBuf) || (NULL == inBufL) || 
-  (NULL == inBufR)){appError = ERROR_CODE_5; return RES_ERROR_PARAM;}
+  if ((NULL == outBuf) || (NULL == inBufL) || (NULL == inBufR))
+  {appError = ERROR_CODE_5; return RES_ERROR_PARAM;}
+
+  uint16_t nSamples = BUF_HALF;
 
   switch (bufType)
   {
@@ -938,6 +1092,7 @@ static tErrorCode EncodeData(void *inBufL, void *inBufR, int16_t *outBuf,
 
   return RES_OK;
 }
+
 // *****************************************************************************
 static tErrorCode ProcessData(void)
 // *****************************************************************************
@@ -958,25 +1113,29 @@ static tErrorCode ProcessData(void)
       if (RES_OK != DecodeData(&adc[BUF_BEGIN], 
                     &general[CHANNEL_0][BUF_BEGIN],
                     &general[CHANNEL_1][BUF_BEGIN], 
-                    BUF_HALF, F32)) return RES_ERROR;
+                    Q15)) return RES_ERROR;
 
       // Normalize channels
       if (RES_OK != NormalizeChannels(&general[CHANNEL_0][BUF_BEGIN], 
-                                      &normGain[CHANNEL_0], BUF_HALF, 
-                                      F32))
+                                      &normGain[CHANNEL_0], Q15))
       {return RES_ERROR;}
 
       // Filter all channels
-      if (RES_OK != ApplyFilters(&general[CHANNEL_0][BUF_BEGIN], insFIRf32,
-                    insLibFIRf32,
-                    insIIRf32, insIIRq15, insIIRq31, insLibIIRf32, insLibIIRq15, 
-                    insLibIIRq31, BUF_HALF, F32))
+      if (RES_OK != ApplyFilters(&general[CHANNEL_0][BUF_BEGIN], FIRf32, FIRq15,
+                    insFIRf32, insFIRq15, IIRf32, IIRq15, IIRq31, insIIRf32, 
+                    insIIRq15, insIIRq31, Q15))
+      {return RES_ERROR;}
+
+      // Apply convolution
+      if (RES_OK != ApplyConvolution(&general[CHANNEL_0][BUF_BEGIN], 
+                    convq15, Q15))
       {return RES_ERROR;}
 
       // Encode DAC1 to PCM
       if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_BEGIN], 
-                    &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], 
-                    BUF_HALF, F32)) return RES_ERROR;
+                    &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], Q15))
+      {return RES_ERROR;}
+
         break;
 
     case 2: // Buffer full, process second half
@@ -984,26 +1143,29 @@ static tErrorCode ProcessData(void)
       // Decode ADC1 from PCM
       if (RES_OK != DecodeData(&adc[BUFFER_SIZE], 
                     &general[CHANNEL_0][BUF_HALF],
-                    &general[CHANNEL_1][BUF_HALF],
-                    BUF_HALF, F32)) return RES_ERROR;
+                    &general[CHANNEL_1][BUF_HALF], Q15))
+      {return RES_ERROR;}
 
       // Normalize channels
       if (RES_OK != NormalizeChannels(&general[CHANNEL_0][BUF_HALF], 
-                                      &normGain[CHANNEL_0], BUF_HALF, 
-                                      F32))
+                                      &normGain[CHANNEL_0], Q15))
       {return RES_ERROR;}
 
-      // // Filter all channels
-      if (RES_OK != ApplyFilters(&general[CHANNEL_0][BUF_HALF], insFIRf32, 
-                    insLibFIRf32,
-                    insIIRf32, insIIRq15, insIIRq31, insLibIIRf32, insLibIIRq15, 
-                    insLibIIRq31, BUF_HALF, F32)) 
+      // Filter all channels
+      if (RES_OK != ApplyFilters(&general[CHANNEL_0][BUF_HALF], FIRf32, FIRq15,
+                    insFIRf32, insFIRq15, IIRf32, IIRq15, IIRq31, insIIRf32, 
+                    insIIRq15, insIIRq31, Q15)) 
+      {return RES_ERROR;}
+
+      // Apply convolution
+      if (RES_OK != ApplyConvolution(&general[CHANNEL_0][BUF_HALF], 
+                    convq15, Q15))
       {return RES_ERROR;}
 
       // Encode DAC1 to PCM
       if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_HALF], 
-                    &general[CHANNEL_1][BUF_HALF], &dac[BUFFER_SIZE],
-                    BUF_HALF, F32)) return RES_ERROR;
+                    &general[CHANNEL_1][BUF_HALF], &dac[BUFFER_SIZE], Q15))
+      {return RES_ERROR;}
         break;
     
     default:
@@ -1016,6 +1178,41 @@ static tErrorCode ProcessData(void)
   cpuUsage = (float)timerCount * 100.0 / DMA_INT_PERIOD;
   timerCount = 0; // Performance monitor reset timer
   dataReadyFlag = 0;
+  return RES_OK;
+}
+
+// *****************************************************************************
+static tErrorCode CheckConfig(void)
+// *****************************************************************************
+// Description: Checks if filter config changed and configures filters if true
+// Parameters: none
+// Returns: error code
+// *****************************************************************************
+{
+  switch (filterConfigFlag)
+  {
+    case 0:
+      break;
+  
+    case 1:
+      if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
+                    insIIRf32, insIIRq15, insIIRq31, normGain))
+      {appError = ERROR_CODE_15; return RES_ERROR;}
+    
+      if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, 
+                    insFIRf32, insFIRq15))
+      {appError = ERROR_CODE_16; return RES_ERROR;}
+    
+      if (RES_OK != CheckParams())
+      {appError = ERROR_CODE_17; return RES_ERROR;}
+      filterConfigFlag = 0;
+      break;
+
+    default:
+      return RES_ERROR;
+      break;
+  }
+
   return RES_OK;
 }
 
