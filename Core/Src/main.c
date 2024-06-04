@@ -43,13 +43,15 @@
 /* USER CODE BEGIN PD */
 #define BUF_BEGIN 0
 #define BUF_HALF (BUFFER_SIZE/2)
-#define DMA_INT_PERIOD (float)((BUFFER_SIZE / 2) * 100000 / SAMPLE_RATE) // 10 x us
+#define TIMER_RES 8 // Timer resolution multiplier
 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define SET_TO_RAMD2   __attribute__ ((section (".RAMD2_data")))
+#define SET_TO_ITCMRAM __attribute__ ((section (".ITCMRAM_data")))
+#define SET_TO_DTCMRAM __attribute__ ((section (".DTCMRAM_data")))
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -63,66 +65,60 @@ TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim16;
 
 /* USER CODE BEGIN PV */
-
-typedef union
-{
-  float f32;
-  int16_t q15;
-  int32_t q31;
-} tUnionBuf;
-
-typedef enum
-{
-  F32,
-  Q15,
-  Q31
-} tArithmetic;
-
 // *****************************************************************************
 // INPUT, OUTPUT AND PROCESSING BUFFERS
-static uint32_t adc[BUFFER_SIZE*2];                  //  RX buffer (Stereo PCM)
-static int16_t dac[BUFFER_SIZE*2];                   //  TX buffer (Stereo PCM)
-static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE]; //  Processing buffers
+//  RX buffer (Stereo PCM)
+static uint32_t adc[BUFFER_SIZE*2] SET_TO_RAMD2;
+
+//  TX buffer (Stereo PCM)
+static int16_t dac[BUFFER_SIZE*2] SET_TO_RAMD2;
+
+//  Processing buffers
+static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE] SET_TO_ITCMRAM; 
 // *****************************************************************************
 
 // *****************************************************************************
 // Convolution instances
-static tConvq15 convq15[MAX_CONV];
+static tConvq15 convq15[MAX_CONV] SET_TO_DTCMRAM; 
 // *****************************************************************************
 
 // *****************************************************************************
 // FIR instances
-static tFIRf32 FIRf32[MAX_FILTERS];
-static tFIRq15 FIRq15[MAX_FILTERS];
+static tFIRf32 FIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
+static tFIRq15 FIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
 
 // FIR arm_math.h instances
-static arm_fir_instance_f32 insFIRf32[MAX_FILTERS];
-static arm_fir_instance_q15 insFIRq15[MAX_FILTERS];
+static arm_fir_instance_f32 insFIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
+static arm_fir_instance_q15 insFIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
 // *****************************************************************************
 
 // *****************************************************************************
+// System configuration structure
+static tParamConfig filterConfig[MAX_FILTERS];  
+
+// Anti saturation pre-IIR gain
+static tGain normGain[MAX_CHANNELS] SET_TO_DTCMRAM;
+
 // IIR 2nd order biquads
-static tIIRf32 IIRf32[MAX_FILTERS];    // IIR 2nd order instance
-static tIIRq15 IIRq15[MAX_FILTERS];    // IIR 2nd order instance
-static tIIRq31 IIRq31[MAX_FILTERS];    // IIR 2nd order instance
-static tParamConfig filterConfig[MAX_FILTERS]; // IIR 2nd order config params
-static tGain normGain[MAX_CHANNELS]; // Anti saturation pre-filter gain
+static tIIRf32 IIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
+static tIIRq15 IIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
+static tIIRq31 IIRq31[MAX_FILTERS] SET_TO_DTCMRAM;
 
 // IIR arm_math.h 2nd order biquads pointer instance
-static arm_biquad_cascade_df2T_instance_f32 insIIRf32[MAX_FILTERS];
-static arm_biquad_casd_df1_inst_q15 insIIRq15[MAX_FILTERS];
-static arm_biquad_casd_df1_inst_q31 insIIRq31[MAX_FILTERS];
+static arm_biquad_cascade_df2T_instance_f32 insIIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
+static arm_biquad_casd_df1_inst_q15 insIIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
+static arm_biquad_casd_df1_inst_q31 insIIRq31[MAX_FILTERS] SET_TO_DTCMRAM;
 // *****************************************************************************
 
 // *****************************************************************************
 // APP LOGIC STATE VARIABLES
-static tErrorCode appError;
-static uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
-static uint8_t filterConfigFlag = 0; // 0 = configured, 1 = new config received
-static uint32_t timerCount = 0;   // Performance monitor timer
-static float cpuUsage = 0;        // CPU real-time usage (%)
-uint16_t nSamples = BUF_HALF;
-uint16_t bufSize = BUFFER_SIZE;
+static SET_TO_DTCMRAM tErrorCode appError;
+static SET_TO_DTCMRAM uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
+static SET_TO_DTCMRAM uint8_t filterConfigFlag = 0; // 0 = configured, 1 = new config received
+static SET_TO_DTCMRAM uint16_t timerCount = 0;   // Performance monitor timer
+static SET_TO_DTCMRAM float cpuUsage = 0;        // CPU real-time usage (%)
+static SET_TO_DTCMRAM uint16_t nSamples = BUF_HALF;
+static SET_TO_DTCMRAM uint16_t bufSize = BUFFER_SIZE;
 
 
 // *****************************************************************************
@@ -139,6 +135,7 @@ static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
 /* USER CODE BEGIN PFP */
 static void AppInit(void);
+static void CacheInit(void);
 static tErrorCode CheckParams(void);
 static tErrorCode ProcessData(void);
 static tErrorCode CheckConfig(void);
@@ -176,8 +173,8 @@ int main(void)
   AppInit();
   DSP_TestFilters(filterConfig);
   
-  if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
-  insIIRf32, insIIRq15, insIIRq31, normGain))
+  if (RES_OK != DSP_UpdateIIRs(filterConfig, IIRf32, IIRq15, IIRq31, insIIRf32,
+                insIIRq15, insIIRq31, normGain))
   {appError = ERROR_CODE_15; goto error;}
 
   if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
@@ -189,6 +186,9 @@ int main(void)
 
   if (RES_OK != CheckParams())
   {appError = ERROR_CODE_17; goto error;}
+
+  CacheInit();
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -217,7 +217,6 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     error:
-      // Toggle an LED to notify error
       Error_Handler();
   /* USER CODE END 3 */
 }
@@ -237,7 +236,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
@@ -249,10 +248,10 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 48;
+  RCC_OscInitStruct.PLL.PLLN = 68;
   RCC_OscInitStruct.PLL.PLLP = 1;
-  RCC_OscInitStruct.PLL.PLLQ = 3;
-  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 8;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 6144;
@@ -274,7 +273,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV16;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -435,7 +434,7 @@ static void MX_TIM16_Init(void)
 
   /* USER CODE END TIM16_Init 1 */
   htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 124-1;
+  htim16.Init.Prescaler = 48-1;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim16.Init.Period = 1;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -458,16 +457,15 @@ static void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
-  __HAL_RCC_DMA2_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
-  /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
 
 }
 
@@ -610,12 +608,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if(htim->Instance == TIM16)
   {
-    timerCount++; // Performance monitor increase, period = 10 uS
+    timerCount++; // Performance monitor increase, Freq = Fs * TIMER_RES
     // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);         // Toggle LED red
   }
   if(htim->Instance == TIM3)
   {
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);            // Toggle LED red
+    // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);            // Toggle LED red
   }
 }
 
@@ -627,8 +625,7 @@ void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef* hi2s2)
 // Returns: nothing
 // *****************************************************************************
 {
-    HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);   // Toggle LED amarillo
-    if (0 == dataReadyFlag) timerCount = 0; // Performance monitor reset timer
+    HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);
     dataReadyFlag = 1;
 }
 
@@ -640,8 +637,7 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 // Returns: nothing
 // *****************************************************************************
 {
-    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);     // Toggle LED verde
-    if (0 == dataReadyFlag) timerCount = 0; // Performance monitor reset timer
+    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
     dataReadyFlag = 2;
 }
 
@@ -1108,13 +1104,15 @@ static tErrorCode ProcessData(void)
       return RES_OK;
       
     case 1: // Buffer half full, process first half
-      
+    cpuUsage = 100.0 * (1 - ((float)timerCount / (float)(BUF_HALF * TIMER_RES)));
+    htim16.Instance->CR1 &= ~TIM_CR1_CEN; // Stop timer
+
       // Decode ADC1 from PCM
       if (RES_OK != DecodeData(&adc[BUF_BEGIN], 
                     &general[CHANNEL_0][BUF_BEGIN],
                     &general[CHANNEL_1][BUF_BEGIN], 
                     Q15)) return RES_ERROR;
-
+      
       // Normalize channels
       if (RES_OK != NormalizeChannels(&general[CHANNEL_0][BUF_BEGIN], 
                                       &normGain[CHANNEL_0], Q15))
@@ -1136,10 +1134,15 @@ static tErrorCode ProcessData(void)
                     &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], Q15))
       {return RES_ERROR;}
 
+      SCB_CleanInvalidateDCache();
+      htim16.Instance->CR1 |= TIM_CR1_CEN; // Resume timer
+      timerCount = 0; // Performance monitor reset counter
         break;
 
     case 2: // Buffer full, process second half
-      
+    cpuUsage = 100.0 * (1 - ((float)timerCount / (float)(BUF_HALF * TIMER_RES)));
+    htim16.Instance->CR1 &= ~TIM_CR1_CEN; // Stop timer
+
       // Decode ADC1 from PCM
       if (RES_OK != DecodeData(&adc[BUFFER_SIZE], 
                     &general[CHANNEL_0][BUF_HALF],
@@ -1166,6 +1169,10 @@ static tErrorCode ProcessData(void)
       if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_HALF], 
                     &general[CHANNEL_1][BUF_HALF], &dac[BUFFER_SIZE], Q15))
       {return RES_ERROR;}
+
+      SCB_CleanInvalidateDCache();
+      htim16.Instance->CR1 |= TIM_CR1_CEN; // Resume timer
+      timerCount = 0; // Performance monitor reset counter
         break;
     
     default:
@@ -1173,10 +1180,7 @@ static tErrorCode ProcessData(void)
       return RES_ERROR;
         break;
   }
-  
-  //while(timerCount < 1.01 * DMA_INT_PERIOD) ADD BEFORE ENCODING TO TEST LIMIT
-  cpuUsage = (float)timerCount * 100.0 / DMA_INT_PERIOD;
-  timerCount = 0; // Performance monitor reset timer
+
   dataReadyFlag = 0;
   return RES_OK;
 }
@@ -1195,7 +1199,7 @@ static tErrorCode CheckConfig(void)
       break;
   
     case 1:
-      if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
+      if (RES_OK != DSP_UpdateIIRs(filterConfig, IIRf32, IIRq15, IIRq31, 
                     insIIRf32, insIIRq15, insIIRq31, normGain))
       {appError = ERROR_CODE_15; return RES_ERROR;}
     
@@ -1214,6 +1218,19 @@ static tErrorCode CheckConfig(void)
   }
 
   return RES_OK;
+}
+
+// *****************************************************************************
+static void CacheInit(void)
+// *****************************************************************************
+// Description: Initializes caches.
+// Parameters: None.
+// Returns: Nothing.
+// *****************************************************************************
+{
+  SCB_InvalidateICache();
+  SCB_EnableICache();
+  SCB_EnableDCache();
 }
 
 /* USER CODE END 4 */

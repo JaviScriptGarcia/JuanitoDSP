@@ -43,12 +43,13 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Specify the memory areas */
 MEMORY
 {
-  ITCMRAM (xrw)    : ORIGIN = 0x00000000,   LENGTH = 64K
-  DTCMRAM (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x08000000,   LENGTH = 1024K
-  RAM_D1  (xrw)    : ORIGIN = 0x24000000,   LENGTH = 320K
-  RAM_D2  (xrw)    : ORIGIN = 0x30000000,   LENGTH = 32K
-  RAM_D3  (xrw)    : ORIGIN = 0x38000000,   LENGTH = 16K
+  ITCMRAM (xrw)      : ORIGIN = 0x00000000,   LENGTH = 64K
+  ITCMRAM_USER (xrw) : ORIGIN = 0x00001000,   LENGTH = 60K
+  DTCMRAM (xrw)      : ORIGIN = 0x20000000,   LENGTH = 128K
+  FLASH    (rx)      : ORIGIN = 0x08000000,   LENGTH = 1024K
+  RAM_D1  (xrw)      : ORIGIN = 0x24000000,   LENGTH = 320K
+  RAM_D2  (xrw)      : ORIGIN = 0x30000000,   LENGTH = 32K
+  RAM_D3  (xrw)      : ORIGIN = 0x38000000,   LENGTH = 16K
 }
 
 /* Define output sections */
@@ -169,6 +170,26 @@ SECTIONS
     libm.a ( * )
     libgcc.a ( * )
   }
+
+  .RAMD2_data :
+{
+    KEEP(*(.RAMD2_data))
+} >RAM_D2
+
+  .RAMD3_data :
+{
+    KEEP(*(.RAMD3_data))
+} >RAM_D3
+
+  .DTCMRAM_data :
+{
+    KEEP(*(.DTCMRAM_data))
+} >DTCMRAM
+
+  .ITCMRAM_data :
+{
+    KEEP(*(.ITCMRAM_data))
+} >ITCMRAM_USER
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }

@@ -5,7 +5,6 @@
 
 // *****************************************************************************
 // Includes
-
 #include <stdio.h>
 #include <stdint.h>
 #include <limits.h>
@@ -13,20 +12,17 @@
 #ifndef _ARM_MATH_H
 #include <arm_math.h>
 #endif
-#include "uty.h"
 #include "dsp.h"
+#include "coeffs.h"
+#include "uty.h"
 #include "conv.h"
 
 // *****************************************************************************
 // Defines 
-
 // Frequency response plot parameters
 #define PLOT_RESOLUTION       100
 #define PLOTX_START           20.0    //Hz
 #define PLOTX_END             20000.0 //Hz
-
-// Macros
-#define c2d(a) (a/((double)SAMPLE_RATE/2)) // Convert to discrete frequency
 
 // *****************************************************************************
 // Variables 
@@ -48,16 +44,25 @@ tErrorCode DSP_Convolution_q15_arm(int16_t *buf, uint16_t nSamples,
 {
   if ((NULL == buf) || (NULL == ir) || (4 > nSamples)) return RES_ERROR_PARAM;
   
-  int16_t sizeIR = ir->size;
+  uint16_t sizeIR = ir->size;
+  int16_t *tail = ir->tail;
   int16_t inLen = nSamples + sizeIR;
   int16_t input[inLen]; 
 
   // Build input signal from actual and past samples
-  memmove(input, ir->tail, sizeof(int16_t) * sizeIR);
-  memmove(input + sizeIR, buf, sizeof(int16_t) * nSamples);
+  memcpy(input, tail, sizeof(int16_t) * sizeIR);
+  memcpy(input + sizeIR, buf, sizeof(int16_t) * nSamples);
 
   // Save last samples for next convolution
-  memmove(ir->tail, &buf[nSamples - sizeIR], sizeof(int16_t) * sizeIR);
+  if (sizeIR < nSamples)
+  {
+    memcpy(tail, &buf[nSamples - sizeIR], sizeof(int16_t) * sizeIR);
+  }
+  else
+  {
+    memmove(tail, tail + nSamples, sizeof(int16_t) * (sizeIR - nSamples));
+    memcpy(tail + (sizeIR - nSamples), buf, sizeof(int16_t) * nSamples);
+  }
   
   if (ARM_MATH_SUCCESS != arm_conv_partial_fast_q15(input, inLen, ir->coeffs, 
                           sizeIR, buf - sizeIR, sizeIR, nSamples))
@@ -589,7 +594,7 @@ tErrorCode DSP_UpdateConvolutionInstances(tConvq15 *conv)
   if (NULL == conv) return RES_ERROR_PARAM;
 
   CONV_Test(conv->coeffs, &(conv->size));
-  conv->channel = CHANNEL_NONE;
+  conv->channel = CHANNEL_0;
 
   return RES_OK;
 }
@@ -648,50 +653,8 @@ static tErrorCode DSP_PlotMagnitude(tIIRf32 *IIRf32, double *hLinear,
   return RES_OK;
 }
 
-
 // *****************************************************************************
-static tErrorCode DSP_GetFIRCoeffsf32(float fc, float *coeffs, 
-                                      uint16_t *firSize)
-// *****************************************************************************
-// Description: Computes FIR lowpass coeffs based in the Windowed-Sinc Method. 
-// Uses Hann window. Odd and symmetrical Impulse Responses.
-// Parameters: 
-//   fc: cutoff frequency.
-//   *coeffs: Pointer to the array storing the coefficients.
-//   *firSize: Pointer to the variable storing the number of filter taps.
-// Returns: Error code.
-// *****************************************************************************
-{
-  if (NULL == coeffs) return RES_ERROR_PARAM;
-
-  uint16_t i;
-  uint16_t halfSize;
-  double w = (double)PI * c2d(fc);
-
-  // Optimal size to cover the main and first side lobes of sinc function
-  *firSize = (uint16_t)((2 * round((SAMPLE_RATE / fc))) - 1);
-  halfSize = *firSize >> 1;
-
-  // Get truncated sinc
-  for (i = 0; i < halfSize; i++)
-  {
-    coeffs[i] = sin(w * (float)(i - halfSize)) / (PI * (float)(i - halfSize));
-    coeffs[*firSize-1-i] = coeffs[i]; // Symmetrical copy
-  }
-  coeffs[halfSize] = w / PI; // Center tap
-
-  // Apply Hann window
-  for (i = 0; i < *firSize; i++)
-  {
-    *coeffs *= 0.54 - 0.46 * cos(2.0 * PI * ((float)i / (*firSize - 1))); 
-    coeffs++;
-  }
-
-  return RES_OK;
-}
-
-// *****************************************************************************
-static tErrorCode DSP_ComputeFixedFIRCoefs(float *coeff32, tFIRq15 *FIRq15)
+static tErrorCode DSP_UpdateFixedFIRCoefs(float *coeff32, tFIRq15 *FIRq15)
 // *****************************************************************************
 // Description: Quantizes the fixed point FIR coefficients from a given
 // set of floating point coefficients
@@ -743,7 +706,7 @@ tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32,
     {
       firCoeffs = FIRf32->coeffs;
       firSize = &(FIRf32->size);
-      if (RES_OK != DSP_GetFIRCoeffsf32(pCfg->freq, firCoeffs, firSize))
+      if (RES_OK != COEF_GetFIRCoeffsf32(pCfg->freq, firCoeffs, firSize))
       {return RES_ERROR;}
 
       switch (pCfg->type)
@@ -765,7 +728,6 @@ tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32,
           break;
       }
 
-
         /*Minimax method*/  
         /*Inverse FT from arbitrary complex FR*/
   
@@ -774,7 +736,7 @@ tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32,
       FIRf32->size = *firSize;
       FIRq15->size = *firSize;
 
-      if (RES_OK != DSP_ComputeFixedFIRCoefs(firCoeffs, FIRq15))
+      if (RES_OK != DSP_UpdateFixedFIRCoefs(firCoeffs, FIRq15))
       {return RES_ERROR;}
 
       arm_fir_init_f32(f, FIRf32->size, FIRf32->coeffs, FIRf32->delays, 
@@ -841,8 +803,8 @@ static tErrorCode DSP_UpdateNormGain(tGain *normGain, double *fResponse,
 }
 
 // *****************************************************************************
-static tErrorCode DSP_ComputeFixedIIRCoefs(float *coeff32, 
-                  tIIRq15 *IIRq15, tIIRq31 *IIRq31)
+static tErrorCode DSP_UpdateFixedIIRs(float *coeff32, tIIRq15 *IIRq15, 
+                                      tIIRq31 *IIRq31)
 // *****************************************************************************
 // Description: Quantizes the fixed point IIR coefficients from a given
 // set of floating point coefficients
@@ -893,38 +855,37 @@ static tErrorCode DSP_ComputeFixedIIRCoefs(float *coeff32,
 }
 
 // *****************************************************************************
-tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg, 
-                                  tIIRf32 *IIRf32,
-                                  tIIRq15 *IIRq15,
-                                  tIIRq31 *IIRq31, 
-                                  arm_biquad_cascade_df2T_instance_f32 *s,
-                                  arm_biquad_casd_df1_inst_q15 *q,
-                                  arm_biquad_casd_df1_inst_q31 *r,
-                                  tGain *normGain)
+tErrorCode DSP_UpdateIIRs(tParamConfig *pCfg, tIIRf32 *IIRf32, tIIRq15 *IIRq15,
+                          tIIRq31 *IIRq31,
+                          arm_biquad_cascade_df2T_instance_f32 *s,
+                          arm_biquad_casd_df1_inst_q15 *q,
+                          arm_biquad_casd_df1_inst_q31 *r,
+                          tGain *normGain)
 // *****************************************************************************
 // Description: Updates the filter coefficients with the new parameter config
 // received from master. Adapted to work with CMSIS-DSP filters from 
 // Audio EQ Cookbook, by Robert Bristow-Johnson. Updates normalization gain.
 // Parameters: 
-//   *pCfg: Pointer to the structure containing design parameters
-//   *IIRf32: pointer to the f32 structure containing array for coefficients
-//   *IIRq15: Pointer to the q15 structure containing array for coefficients
-//   *IIRq31: Pointer to the q31 structure containing array for coefficients
-//   *s: Pointer to the f32 structure containing pointers for CMSIS-DSP filters
-//   *q: Pointer to the q15 structure containing pointers for CMSIS-DSP filters
-//   *r: Pointer to the q31 structure containing pointers for CMSIS-DSP filters
-//   *normGain: Pointer to the normalization gain array
-// Returns: Error code 
+//   *pCfg: Pointer to the structure containing design parameters.
+//   *IIRf32: pointer to the f32 structure containing array for coefficients.
+//   *IIRq15: Pointer to the q15 structure containing array for coefficients.
+//   *IIRq31: Pointer to the q31 structure containing array for coefficients.
+//   *s: Pointer to the f32 structure containing pointers for CMSIS-DSP filters.
+//   *q: Pointer to the q15 structure containing pointers for CMSIS-DSP filters.
+//   *r: Pointer to the q31 structure containing pointers for CMSIS-DSP filters.
+//   *normGain: Pointer to the normalization gain array.
+// Returns: Error code.
 // *****************************************************************************
 {
-  if ((NULL == pCfg) || (NULL == s) || (NULL == IIRf32) || (NULL == IIRq15)) 
+  if ((NULL == pCfg) || (NULL == s) || (NULL == q) || (NULL == r) ||
+      (NULL == IIRf32) || (NULL == IIRq15) || (NULL == IIRq31) || 
+      (NULL == normGain)) 
   return RES_ERROR_PARAM;
   
   uint8_t i; 
   float w0 = 0;
   double a = 0;
   float A = 0;
-  float a0 = 0;
   float *coeff; // Pointer to filter coefficient array
 
   for (i = 0; i < MAX_FILTERS; i++)
@@ -936,94 +897,73 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
       A =  pow(10.0,(double)(pCfg->gain/40));
       coeff = IIRf32->coeffs; // Pointer to filter coefficient array
 
+      // Get f32 coefficients for passed parameters
       switch (pCfg->type)
       {
         case IIRLOWPASS: 
-                a0 =                  1 + a;
-          coeff[3] =     (2 * cos(w0)) / a0;  // a1
-          coeff[4] =         - (1 - a) / a0;  // a2
-          coeff[0] = ((1 - cos(w0))/2) / a0;  // b0
-          coeff[1] =           2 * coeff[0];  // b1
-          coeff[2] =               coeff[0];  // b2
-        break;
+          if (RES_OK != COEF_GetIIRLowPass(coeff, w0, a)) return RES_ERROR;
+          break;
     
         case IIRHIGHPASS:
-                a0 =                  1 + a;
-          coeff[3] =  - (-2 * cos(w0)) / a0;  // a1
-          coeff[4] =         - (1 - a) / a0;  // a2
-          coeff[0] = ((1 + cos(w0))/2) / a0;  // b0
-          coeff[1] =          -2 * coeff[0];  // b1
-          coeff[2] =               coeff[0];  // b2
-        break;
+          if (RES_OK != COEF_GetIIRHighPass(coeff, w0, a)) return RES_ERROR;
+          break;
     
         case IIRPEAK:
-                a0 =           1 + (a / A);
-          coeff[3] = - (-2 * cos(w0)) / a0;  // a1
-          coeff[4] =  - (1 - (a / A)) / a0;  // a2
-          coeff[0] =    (1 + (a * A)) / a0;  // b0
-          coeff[1] =            - coeff[3];  // b1
-          coeff[2] =    (1 - (a * A)) / a0;  // b2
-        break;
+          if (RES_OK != COEF_GetIIRPeak(coeff, w0, a, A)) return RES_ERROR;
+          break;
     
         case IIRLOWSHELF:
-                a0 =            (1 + A) + (A - 1) * cos(w0) + 2 * a * sqrt(A);
-          coeff[3] =                   2 * ((A - 1) + (A + 1) * cos(w0)) / a0;
-          coeff[4] =   - ((1 + A) + (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;
-          coeff[0] = A * ((A + 1) - (A - 1) * cos(w0) + 2 * sqrt(A) * a) / a0;
-          coeff[1] =               2 * A * ((A - 1) - (A + 1) * cos(w0)) / a0;
-          coeff[2] = A * ((A + 1) - (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0;
-        break;
+          if (RES_OK != COEF_GetIIRLowShelf(coeff, w0, a, A)) return RES_ERROR;
+          break;
     
         case IIRHIGHSHELF:
-                a0 =            (1 + A) - (A - 1) * cos(w0) + 2 * a * sqrt(A);
-          coeff[3] =                  -2 * ((A - 1) - (A + 1) * cos(w0)) / a0;
-          coeff[4] =   - ((1 + A) - (A - 1) * cos(w0) - 2 * a * sqrt(A)) / a0;
-          coeff[0] = A * ((A + 1) + (A - 1) * cos(w0) + 2 * sqrt(A) * a) / a0;
-          coeff[1] =             - 2 * A * ((A - 1) + (A + 1) * cos(w0)) / a0;
-          coeff[2] = A * ((A + 1) + (A - 1) * cos(w0) - 2 * sqrt(A) * a) / a0;
-        break;
+          if (RES_OK != COEF_GetIIRHighShelf(coeff, w0, a, A)) return RES_ERROR;
+          break;
     
         default:
           return RES_ERROR_PARAM;
       }
 
-    if (RES_OK != DSP_ComputeFixedIIRCoefs(coeff, IIRq15, IIRq31))
-    {return RES_ERROR;}
-
-    // Set CMSIS-DSP library instances
-    arm_biquad_cascade_df2T_init_f32(s, 1, IIRf32->coeffs, IIRf32->delays);
-    arm_biquad_cascade_df1_init_q15(q, 1, IIRq15->coeffs, IIRq15->delays, 
-                                    IIRq15->postShift);
-    arm_biquad_cascade_df1_init_q31(r, 1, IIRq31->coeffs, IIRq31->delays, 
-                                    IIRq31->postShift);
-
-    // Assign filter channel to instances
-    IIRf32->channel = pCfg->channel;
-    IIRq15->channel = pCfg->channel;
-    IIRq31->channel = pCfg->channel;
+      // Quantize coefficients for q31 and q15 arithmetics
+      if (RES_OK != DSP_UpdateFixedIIRs(coeff, IIRq15, IIRq31))
+      {return RES_ERROR;}
+  
+      // Update CMSIS-DSP library instances with computed coefficients
+      arm_biquad_cascade_df2T_init_f32(s, 1, IIRf32->coeffs, IIRf32->delays);
+      arm_biquad_cascade_df1_init_q15(q, 1, IIRq15->coeffs, IIRq15->delays, 
+                                      IIRq15->postShift);
+      arm_biquad_cascade_df1_init_q31(r, 1, IIRq31->coeffs, IIRq31->delays, 
+                                      IIRq31->postShift);
+  
+      // Assign channel to calculated filters
+      IIRf32->channel = pCfg->channel;
+      IIRq15->channel = pCfg->channel;
+      IIRq31->channel = pCfg->channel;
     }
 
-    IIRq15++;
-    IIRq31++;
+    // Increment pointers for next filter
     IIRf32++;
+    IIRq31++;
+    IIRq15++;
     q++;
     r++;
     s++;
     pCfg++;
   }
 
-  IIRq15 -= MAX_FILTERS;
+  // Reset f32 pointer to first filter
   IIRf32 -= MAX_FILTERS;
   
-  double fResponse[PLOT_RESOLUTION];  // Store frequency response temporarily
-  uint8_t j;
-  for (j = CHANNEL_0; j < MAX_CHANNELS; j++)
+  // Normalize channel gain for magnitude response of calculated filters
+  double fResponse[PLOT_RESOLUTION];
+  for (i = CHANNEL_0; i < MAX_CHANNELS; i++)
   {
-    if (RES_OK != DSP_PlotMagnitude(IIRf32, fResponse, j)) return RES_ERROR;
-    if (RES_OK != DSP_UpdateNormGain(normGain, fResponse, PLOT_RESOLUTION, j)) 
+    if (RES_OK != DSP_PlotMagnitude(IIRf32, fResponse, i)) return RES_ERROR;
+    if (RES_OK != DSP_UpdateNormGain(normGain, fResponse, PLOT_RESOLUTION, i)) 
     {return RES_ERROR;}
     normGain++;
   }
+
   return RES_OK;
 }
 
@@ -1191,16 +1131,22 @@ void DSP_TestFilters(tParamConfig *pCfg)
 // Returns: Nothing
 // *****************************************************************************
 {
-  pCfg->freq =  80;
-  pCfg->q =  0;
-  pCfg->gain =  0;
-  pCfg->type =  FIRLOWPASS;
+  pCfg->freq =  8000;
+  pCfg->q =  0.707;
+  pCfg->gain =  7;
+  pCfg->type =  IIRHIGHSHELF;
   pCfg->channel =  CHANNEL_NONE;
   pCfg++;
-  pCfg->freq =  3000;
-  pCfg->q =  0;
-  pCfg->gain =  0;
-  pCfg->type =  FIRHIGHPASS;
+  pCfg->freq =  300;
+  pCfg->q =  0.707;
+  pCfg->gain =  7;
+  pCfg->type =  IIRLOWSHELF;
+  pCfg->channel =  CHANNEL_NONE;
+  pCfg++;
+    pCfg->freq =  1000;
+  pCfg->q =  2;
+  pCfg->gain =  7;
+  pCfg->type =  IIRPEAK;
   pCfg->channel =  CHANNEL_NONE;
   pCfg++;
 }

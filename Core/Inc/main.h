@@ -36,7 +36,19 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+typedef union
+{
+  float f32;
+  int16_t q15;
+  int32_t q31;
+} tUnionBuf;
 
+typedef enum
+{
+  F32,
+  Q15,
+  Q31
+} tArithmetic;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/

@@ -20,11 +20,11 @@
 #define DSP_H
 
 // Global DSP system configuration
-#define BUFFER_SIZE  4096 // Must be even and +2 times greater than largest IR
+#define BUFFER_SIZE  256 // Must be even and +2 times greater than largest IR
 #define MAX_CONV     2
 #define MAX_FILTERS  4
 #define FIR_MAX_SIZE BUFFER_SIZE/2
-#define CONV_MAX_SIZE BUFFER_SIZE/2
+#define CONV_MAX_SIZE 2048
 #define SAMPLE_RATE  48000
 
 // Hardware configuration
@@ -34,6 +34,9 @@
 
 // Configure processing algorithm method
 #define USE_LIBRARY  // Use CMSIS-DSP library functions if defined
+
+// Macros
+#define c2d(a) (a/((double)SAMPLE_RATE/2)) // Convert to discrete frequency
 
 // *****************************************************************************
 //  Variables
@@ -121,7 +124,7 @@ typedef struct
 {
   float freq, q, gain;
   tFiltType type;
-    tChannel channel;
+  tChannel channel;
 } tParamConfig;
 
 // *****************************************************************************
@@ -171,14 +174,12 @@ tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32,
                                   tFIRq15 *FIRq15, arm_fir_instance_f32 *f,
                                   arm_fir_instance_q15 *g);
 
-tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg, 
-                                  tIIRf32 *instf32,
-                                  tIIRq15 *instq15,
-                                  tIIRq31 *instq31, 
-                                  arm_biquad_cascade_df2T_instance_f32 *s,
-                                  arm_biquad_casd_df1_inst_q15 *q,
-                                  arm_biquad_casd_df1_inst_q31 *r,
-                                  tGain *normGain);
+tErrorCode DSP_UpdateIIRs(tParamConfig *pCfg, tIIRf32 *instf32, tIIRq15 *instq15,
+                          tIIRq31 *instq31, 
+                          arm_biquad_cascade_df2T_instance_f32 *s,
+                          arm_biquad_casd_df1_inst_q15 *q,
+                          arm_biquad_casd_df1_inst_q31 *r,
+                          tGain *normGain);
 
 // Encoding/Decoding
 tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint16_t nSamples);
