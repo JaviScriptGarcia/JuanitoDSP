@@ -62,3 +62,25 @@ void *UTY_GetMaxValue(void *array, uint32_t length, size_t size, tDataType type)
 
   return maxValue;
 }
+
+// *****************************************************************************
+float LinearInterpolation_Uint16ToFloat(uint16_t x, uint16_t xMin, 
+                                        uint16_t xMax, float yMin, float yMax)
+// *****************************************************************************
+// Description: Obtains the proportional floating point equivalent of an integer
+// whithin a restrained range for both variables. 
+// Parameters: 
+//   x: Uint16 value to convert
+//   xMin: Minimum possible value of the integer input
+//   xMax: Maximum possible value of the integer input
+//   yMin: Minimum possible value of the floating point output
+//   yMax: Maximum possible value of the floating point output
+// Returns: Floating point equivalent
+// *****************************************************************************
+{
+  float y;
+
+  y = yMin + ((yMax - yMin) * (float)(x - xMin) / (float)(xMax - xMin));
+  return y;
+}
+

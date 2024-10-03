@@ -20,11 +20,6 @@
 // *****************************************************************************
 // Defines 
 
-// Frequency response plot parameters
-#define PLOT_RESOLUTION       100
-#define PLOTX_START           20.0    //Hz
-#define PLOTX_END             20000.0 //Hz
-
 // Macros
 #define c2d(a) (a/((double)SAMPLE_RATE/2)) // Convert to discrete frequency
 
@@ -623,7 +618,7 @@ static tErrorCode DSP_PlotMagnitude(tIIRf32 *IIRf32, double *hLinear,
   for (j = 0; j < PLOT_RESOLUTION; j++)
   {
     exp = ((double)j)/PLOT_RESOLUTION;
-    frPoints[j] = PLOTX_START * pow((PLOTX_END/PLOTX_START), exp); // Get Hz
+    frPoints[j] = FRANGE_MIN * pow((FRANGE_MAX/FRANGE_MIN), exp); // Get Hz
     dFreq = c2d(frPoints[j]); // Hz to digital frequency
     phi = pow(sin(dFreq*PI/2), 2);
     for (i = 0; i < MAX_FILTERS; i++)
@@ -717,7 +712,7 @@ static tErrorCode DSP_ComputeFixedFIRCoefs(float *coeff32, tFIRq15 *FIRq15)
 }
 
 // *****************************************************************************
-tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32, 
+tErrorCode DSP_UpdateFIRInstances(tFilterConfig *pCfg, tFIRf32 *FIRf32, 
                                   tFIRq15 *FIRq15, arm_fir_instance_f32 *f,
                                   arm_fir_instance_q15 *g)
 // *****************************************************************************
@@ -893,7 +888,7 @@ static tErrorCode DSP_ComputeFixedIIRCoefs(float *coeff32,
 }
 
 // *****************************************************************************
-tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg, 
+tErrorCode DSP_UpdateIIRInstances(tFilterConfig *pCfg, 
                                   tIIRf32 *IIRf32,
                                   tIIRq15 *IIRq15,
                                   tIIRq31 *IIRq31, 
@@ -1028,7 +1023,47 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
 }
 
 // *****************************************************************************
-tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint16_t nSamples)
+tErrorCode DSP_SumChannel(void *dstBuf, void *srcBuf, uint32_t nSamples, 
+                          tArithmetic bufType)
+// *****************************************************************************
+// Description: Dumps one channel's samples into another and normalizes gain. 
+// Both buffers must be equal in length.
+// Parameters: 
+//   *dstBuf: Destination buffer where source samples will be dumped and summed
+//   *srcBuf: Source buffer with samples to dump into destination
+//   nSamples: Length of any of the buffer in samples.
+//   bufType: Type of arithmetic to use.
+// Returns: Error code.
+// *****************************************************************************
+{
+  if ((NULL == dstBuf) || (NULL == srcBuf) || (nSamples < 1)) 
+  return RES_ERROR_PARAM;
+
+  // Sum source and destination
+  switch (bufType)
+  {
+    case Q15:
+      arm_add_q15((q15_t *)dstBuf, (q15_t *)srcBuf, (q15_t *)dstBuf, nSamples);
+      break;
+    case Q31:
+      arm_add_q31((q31_t *)dstBuf, (q31_t *)srcBuf, (q31_t *)dstBuf, nSamples);
+      break;
+    case F32:
+      arm_add_f32((float32_t *)dstBuf, (float32_t *)srcBuf, 
+                  (float32_t *)dstBuf, nSamples);
+      break;
+
+    default:
+      return RES_ERROR_PARAM;
+  }
+  // Normalize in case the result exceeds -0dB
+
+  return RES_OK;
+}
+
+
+// *****************************************************************************
+tErrorCode DSP_Int24ToInt16(int32_t *inBuf, uint16_t nSamples)
 // *****************************************************************************
 // Description: Converts received samples from signed 24 bit to signed 16 bit
 // Parameters:
@@ -1056,7 +1091,7 @@ tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint16_t nSamples)
 }
 
 // *****************************************************************************
-tErrorCode DSP_Int24ToInt32(uint32_t *inBuf, uint16_t nSamples)
+tErrorCode DSP_Int24ToInt32(int32_t *inBuf, uint16_t nSamples)
 // *****************************************************************************
 // Description: Converts received samples from signed 24 bit to signed 16 bit
 // Parameters:
@@ -1084,7 +1119,63 @@ tErrorCode DSP_Int24ToInt32(uint32_t *inBuf, uint16_t nSamples)
 }
 
 // *****************************************************************************
-tErrorCode DSP_DecodePCM_Int16(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
+tErrorCode DSP_Int16ToInt32(int32_t *inBuf, uint16_t nSamples)
+// *****************************************************************************
+// Description: Converts received samples from signed 24 bit to signed 16 bit
+// Parameters:
+//   inBuf: Pointer to the first input buffer position to be converted
+//   nSamples: Number of samples to convert 
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf)) return RES_ERROR_PARAM;
+  
+  nSamples >>= 2;
+
+  while(nSamples--)
+  {
+    *inBuf <<= 16; 
+    inBuf++;
+    *inBuf <<= 16; 
+    inBuf++;
+    *inBuf <<= 16; 
+    inBuf++;
+    *inBuf <<= 16; 
+    inBuf++;
+  }
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_Int32ToInt16(int32_t *inBuf, uint16_t nSamples)
+// *****************************************************************************
+// Description: Converts received samples from signed 24 bit to signed 16 bit
+// Parameters:
+//   inBuf: Pointer to the first input buffer position to be converted
+//   nSamples: Number of samples to convert 
+// Returns: Error code
+// *****************************************************************************
+{
+  if ((NULL == inBuf)) return RES_ERROR_PARAM;
+  
+  nSamples >>= 2;
+
+  while(nSamples--)
+  {
+    *inBuf >>= 16; 
+    inBuf++;
+    *inBuf >>= 16; 
+    inBuf++;
+    *inBuf >>= 16; 
+    inBuf++;
+    *inBuf >>= 16; 
+    inBuf++;
+  }
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode DSP_DecodePCM_Int16(int32_t *inBuf, int16_t *bufL, int16_t *bufR, 
                          uint16_t nSamples)
 // *****************************************************************************
 // Description: Decodes a PCM stereo buffer into two buffers of half length
@@ -1117,7 +1208,7 @@ tErrorCode DSP_DecodePCM_Int16(uint32_t *inBuf, int16_t *bufL, int16_t *bufR,
 }
 
 // *****************************************************************************
-tErrorCode DSP_DecodePCM_Int32(uint32_t *inBuf, int32_t *bufL, int32_t *bufR, 
+tErrorCode DSP_DecodePCM_Int32(int32_t *inBuf, int32_t *bufL, int32_t *bufR, 
                          uint16_t nSamples)
 // *****************************************************************************
 // Description: Decodes a PCM stereo buffer into two buffers of half length
@@ -1183,7 +1274,7 @@ tErrorCode DSP_EncodePCM(int16_t *outBuf, int16_t *bufL, int16_t *bufR,
 }
 
 // *****************************************************************************
-void DSP_TestFilters(tParamConfig *pCfg)
+void DSP_TestFilters(tFilterConfig *pCfg)
 // *****************************************************************************
 // Description: Set filter parameters for testing purposes
 // Parameters: 

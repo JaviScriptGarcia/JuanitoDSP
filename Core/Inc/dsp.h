@@ -20,7 +20,7 @@
 #define DSP_H
 
 // Global DSP system configuration
-#define BUFFER_SIZE  4096 // Must be even and +2 times greater than largest IR
+#define BUFFER_SIZE  32 // Must be even and +2 times greater than largest IR
 #define MAX_CONV     2
 #define MAX_FILTERS  4
 #define FIR_MAX_SIZE BUFFER_SIZE/2
@@ -29,8 +29,19 @@
 
 // Hardware configuration
 #define DAC_QUANTITY 1
-#define ADC_QUANTITY 1
-#define MAX_CHANNELS 2
+#define INPUT_QUANTITY 2
+#define MAX_CHANNELS 4
+
+// Frequency response plot parameters
+#define PLOT_RESOLUTION       100
+#define FRANGE_MIN            20.0    //Hz
+#define FRANGE_MAX            20000.0 //Hz
+
+// Filter configuration limits
+#define GAIN_MIN  -15.0
+#define GAIN_MAX   15.0
+#define Q_MIN      0.1
+#define Q_MAX      10.0
 
 // Configure processing algorithm method
 #define USE_LIBRARY  // Use CMSIS-DSP library functions if defined
@@ -121,8 +132,15 @@ typedef struct
 {
   float freq, q, gain;
   tFiltType type;
-    tChannel channel;
-} tParamConfig;
+  tChannel channel;
+} tFilterConfig;
+
+typedef enum
+{
+  F32,
+  Q15,
+  Q31
+} tArithmetic;
 
 // *****************************************************************************
 // Functions 
@@ -167,11 +185,11 @@ tErrorCode DSP_q31_to_q15_arm(int32_t *inBuf, int16_t *outBuf,
 // Coefficient calculation
 tErrorCode DSP_UpdateConvolutionInstances(tConvq15 *conv);
 
-tErrorCode DSP_UpdateFIRInstances(tParamConfig *pCfg, tFIRf32 *FIRf32, 
+tErrorCode DSP_UpdateFIRInstances(tFilterConfig *pCfg, tFIRf32 *FIRf32, 
                                   tFIRq15 *FIRq15, arm_fir_instance_f32 *f,
                                   arm_fir_instance_q15 *g);
 
-tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg, 
+tErrorCode DSP_UpdateIIRInstances(tFilterConfig *pCfg, 
                                   tIIRf32 *instf32,
                                   tIIRq15 *instq15,
                                   tIIRq31 *instq31, 
@@ -181,16 +199,19 @@ tErrorCode DSP_UpdateIIRInstances(tParamConfig *pCfg,
                                   tGain *normGain);
 
 // Encoding/Decoding
-tErrorCode DSP_Int24ToInt16(uint32_t *inBuf, uint16_t nSamples);
-tErrorCode DSP_Int24ToInt32(uint32_t *inBuf, uint16_t nSamples);
-tErrorCode DSP_DecodePCM_Int16(uint32_t *inBuf, int16_t *bufL, int16_t *bufR, 
+tErrorCode DSP_Int24ToInt16(int32_t *inBuf, uint16_t nSamples);
+tErrorCode DSP_Int24ToInt32(int32_t *inBuf, uint16_t nSamples);
+tErrorCode DSP_Int16ToInt32(int32_t *inBuf, uint16_t nSamples);
+tErrorCode DSP_Int32ToInt16(int32_t *inBuf, uint16_t nSamples);
+tErrorCode DSP_DecodePCM_Int16(int32_t *inBuf, int16_t *bufL, int16_t *bufR, 
                                uint16_t nSamples);
-tErrorCode DSP_DecodePCM_Int32(uint32_t *inBuf, int32_t *bufL, int32_t *bufR, 
+tErrorCode DSP_DecodePCM_Int32(int32_t *inBuf, int32_t *bufL, int32_t *bufR, 
                                uint16_t nSamples);
 tErrorCode DSP_EncodePCM(int16_t *outBuf, int16_t *bufL, int16_t *bufR, 
                                uint16_t nSamples);
 
 // Others
-void DSP_TestFilters(tParamConfig *pCfg);
-
+void DSP_TestFilters(tFilterConfig *pCfg);
+tErrorCode DSP_SumChannel(void *dstBuf, void *srcBuf, uint32_t nSamples, 
+                          tArithmetic bufType);
 

@@ -24,12 +24,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <limits.h>
+#include "bluetooth.h"
 #ifndef DSP_H
 #include "dsp.h"
 #endif
 #ifndef GLOBAL_H
 #include "global.h"
 #endif
+
 // #include "arm_math.h"
 
 /* USER CODE END Includes */
@@ -49,73 +51,99 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define SET_TO_RAMD3   __attribute__ ((section (".RAMD3_data")))
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
-I2S_HandleTypeDef hi2s2;
 I2S_HandleTypeDef hi2s3;
-DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
+
+SAI_HandleTypeDef hsai_BlockA1;
+SAI_HandleTypeDef hsai_BlockB1;
+DMA_HandleTypeDef hdma_sai1_a;
+DMA_HandleTypeDef hdma_sai1_b;
 
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim16;
 
+UART_HandleTypeDef huart9;
+
 /* USER CODE BEGIN PV */
 
-typedef union
+typedef union // Union for mixed-type buffers
 {
   float f32;
   int16_t q15;
   int32_t q31;
 } tUnionBuf;
 
-typedef enum
+enum
 {
-  F32,
-  Q15,
-  Q31
-} tArithmetic;
+  INPUT0 = 0,
+  INPUT1 = 1,
+  INPUT2 = 2,
+  INPUT3 = 3
+}inputID;
 
-// *****************************************************************************
-// INPUT, OUTPUT AND PROCESSING BUFFERS
-static uint32_t adc[BUFFER_SIZE*2];                  //  RX buffer (Stereo PCM)
-static int16_t dac[BUFFER_SIZE*2];                   //  TX buffer (Stereo PCM)
-static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE]; //  Processing buffers
-// *****************************************************************************
+// ****************** INPUT, OUTPUT AND PROCESSING BUFFERS *********************
+static int32_t input[INPUT_QUANTITY][BUFFER_SIZE*2]; //  IN buffer (Stereo PCM)
+static int16_t dac[BUFFER_SIZE*2];                   //  OUT buffer (Stereo PCM)
+static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE]; //  General channels (MONO)
 
-// *****************************************************************************
-// Convolution instances
+// ***************** Convolution instances *************************************
 static tConvq15 convq15[MAX_CONV];
-// *****************************************************************************
 
-// *****************************************************************************
-// FIR instances
+// ***************** FIR instances *********************************************
 static tFIRf32 FIRf32[MAX_FILTERS];
 static tFIRq15 FIRq15[MAX_FILTERS];
 
-// FIR arm_math.h instances
+// ***************** FIR arm_math.h instances **********************************
 static arm_fir_instance_f32 insFIRf32[MAX_FILTERS];
 static arm_fir_instance_q15 insFIRq15[MAX_FILTERS];
-// *****************************************************************************
 
-// *****************************************************************************
-// IIR 2nd order biquads
+
+// ***************** IIR 2nd order biquads *************************************
 static tIIRf32 IIRf32[MAX_FILTERS];    // IIR 2nd order instance
 static tIIRq15 IIRq15[MAX_FILTERS];    // IIR 2nd order instance
 static tIIRq31 IIRq31[MAX_FILTERS];    // IIR 2nd order instance
-static tParamConfig filterConfig[MAX_FILTERS]; // IIR 2nd order config params
-static tGain normGain[MAX_CHANNELS]; // Anti saturation pre-filter gain
+static tFilterConfig filterConfig[MAX_FILTERS]; // IIR 2nd order config params
+static tGain normGain[MAX_CHANNELS];   // Anti saturation pre-filter gain
 
-// IIR arm_math.h 2nd order biquads pointer instance
+// ************** IIR arm_math.h 2nd order biquads pointer instance ************
 static arm_biquad_cascade_df2T_instance_f32 insIIRf32[MAX_FILTERS];
 static arm_biquad_casd_df1_inst_q15 insIIRq15[MAX_FILTERS];
 static arm_biquad_casd_df1_inst_q31 insIIRq31[MAX_FILTERS];
-// *****************************************************************************
 
-// *****************************************************************************
-// APP LOGIC STATE VARIABLES
+// ***************** BT module UART buffers & pointers *************************
+static char uartRx[UART_CHUNK_SIZE];
+static char uartTx[UART_CHUNK_SIZE];
+static char *pUartRx = &uartRx[0];
+static char *pUartTx = &uartTx[0];
+tUartSt uartSt;
+uint16_t bytesToCpltUartRx = 0;
+HAL_StatusTypeDef res;
+
+static struct
+{
+  uint16_t len;
+  tRxCommand command;
+} msg;
+
+static enum 
+{
+  WAIT_RX,
+  NEW_MSG,
+  SENDING
+} uartFSM;
+
+static enum
+{
+  WAITING,
+  FINISHED
+} uartRxCpltFlag, uartTxCpltFlag;
+
+// ********************** APP LOGIC STATE VARIABLES ****************************
 static tErrorCode appError;
 static uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
 static uint8_t filterConfigFlag = 0; // 0 = configured, 1 = new config received
@@ -123,7 +151,7 @@ static uint32_t timerCount = 0;   // Performance monitor timer
 static float cpuUsage = 0;        // CPU real-time usage (%)
 uint16_t nSamples = BUF_HALF;
 uint16_t bufSize = BUFFER_SIZE;
-
+uint32_t regRead = 0;
 
 // *****************************************************************************
 
@@ -135,13 +163,15 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_TIM3_Init(void);
-static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
+static void MX_SAI1_Init(void);
+static void MX_UART9_Init(void);
 /* USER CODE BEGIN PFP */
-static void AppInit(void);
+static tErrorCode AppInit(void);
 static tErrorCode CheckParams(void);
 static tErrorCode ProcessData(void);
 static tErrorCode CheckConfig(void);
+static tErrorCode ManageUART(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -173,22 +203,8 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  AppInit();
   DSP_TestFilters(filterConfig);
   
-  if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
-  insIIRf32, insIIRq15, insIIRq31, normGain))
-  {appError = ERROR_CODE_15; goto error;}
-
-  if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
-                insFIRq15))
-  {appError = ERROR_CODE_16; goto error;}
-
-  if (RES_OK != DSP_UpdateConvolutionInstances(convq15))
-  {appError = ERROR_CODE_16; goto error;}
-
-  if (RES_OK != CheckParams())
-  {appError = ERROR_CODE_17; goto error;}
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -196,20 +212,36 @@ int main(void)
   MX_DMA_Init();
   MX_TIM16_Init();
   MX_TIM3_Init();
-  MX_I2S2_Init();
   MX_I2S3_Init();
+  MX_SAI1_Init();
+  MX_UART9_Init();
   /* USER CODE BEGIN 2 */
     HAL_TIM_Base_Start_IT(&htim16);
     HAL_TIM_Base_Start_IT(&htim3);
 
+    // **************** Init DMA for audio IOs *********************************
+    // Wired output
     HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac, BUFFER_SIZE * 2);
-    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc, BUFFER_SIZE * 2);
+    // Wired input
+    HAL_SAI_Receive_DMA(&hsai_BlockB1, (uint8_t*) &input[INPUT0][BUF_BEGIN], 
+                        BUFFER_SIZE * 2);
+    // Bluetooth input
+    HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t*) &input[INPUT1][BUF_BEGIN], 
+                        BUFFER_SIZE * 2);
+
+    // **************** INIT UART AND BT COMMUNICATION *************************
+    HAL_UARTEx_ReceiveToIdle_IT(&huart9, (uint8_t*)uartRx, UART_CHUNK_SIZE);
+    BT_Init(); // Initialize BT communication
+
+    // **************** INIT APP STATE VARIABLES *******************************
+    if (RES_OK != AppInit()) goto error;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     while (1)
     {
+      if (RES_OK != ManageUART())  goto error;
       if (RES_OK != CheckConfig()) goto error;
       if (RES_OK != ProcessData()) goto error;
     }
@@ -237,19 +269,20 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 48;
+  RCC_OscInitStruct.PLL.PLLN = 68;
   RCC_OscInitStruct.PLL.PLLP = 1;
   RCC_OscInitStruct.PLL.PLLQ = 3;
   RCC_OscInitStruct.PLL.PLLR = 2;
@@ -274,47 +307,11 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV16;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
-  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSE, RCC_MCODIV_1);
-}
-
-/**
-  * @brief I2S2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2S2_Init(void)
-{
-
-  /* USER CODE BEGIN I2S2_Init 0 */
-
-  /* USER CODE END I2S2_Init 0 */
-
-  /* USER CODE BEGIN I2S2_Init 1 */
-
-  /* USER CODE END I2S2_Init 1 */
-  hi2s2.Instance = SPI2;
-  hi2s2.Init.Mode = I2S_MODE_MASTER_RX;
-  hi2s2.Init.Standard = I2S_STANDARD_MSB;
-  hi2s2.Init.DataFormat = I2S_DATAFORMAT_24B;
-  hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
-  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_48K;
-  hi2s2.Init.CPOL = I2S_CPOL_LOW;
-  hi2s2.Init.FirstBit = I2S_FIRSTBIT_MSB;
-  hi2s2.Init.WSInversion = I2S_WS_INVERSION_DISABLE;
-  hi2s2.Init.Data24BitAlignment = I2S_DATA_24BIT_ALIGNMENT_RIGHT;
-  hi2s2.Init.MasterKeepIOState = I2S_MASTER_KEEP_IO_STATE_DISABLE;
-  if (HAL_I2S_Init(&hi2s2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2S2_Init 2 */
-
-  /* USER CODE END I2S2_Init 2 */
-
+  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSI48, RCC_MCODIV_1);
 }
 
 /**
@@ -350,6 +347,55 @@ static void MX_I2S3_Init(void)
   /* USER CODE BEGIN I2S3_Init 2 */
 
   /* USER CODE END I2S3_Init 2 */
+
+}
+
+/**
+  * @brief SAI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SAI1_Init(void)
+{
+
+  /* USER CODE BEGIN SAI1_Init 0 */
+
+  /* USER CODE END SAI1_Init 0 */
+
+  /* USER CODE BEGIN SAI1_Init 1 */
+
+  /* USER CODE END SAI1_Init 1 */
+  hsai_BlockA1.Instance = SAI1_Block_A;
+  hsai_BlockA1.Init.AudioMode = SAI_MODEMASTER_RX;
+  hsai_BlockA1.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
+  hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
+  if (HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_32BIT, 2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  hsai_BlockB1.Instance = SAI1_Block_B;
+  hsai_BlockB1.Init.AudioMode = SAI_MODEMASTER_RX;
+  hsai_BlockB1.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockB1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
+  hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockB1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockB1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockB1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockB1.Init.CompandingMode = SAI_NOCOMPANDING;
+  if (HAL_SAI_InitProtocol(&hsai_BlockB1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_24BIT, 2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SAI1_Init 2 */
+
+  /* USER CODE END SAI1_Init 2 */
 
 }
 
@@ -452,14 +498,62 @@ static void MX_TIM16_Init(void)
 }
 
 /**
+  * @brief UART9 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART9_Init(void)
+{
+
+  /* USER CODE BEGIN UART9_Init 0 */
+
+  /* USER CODE END UART9_Init 0 */
+
+  /* USER CODE BEGIN UART9_Init 1 */
+
+  /* USER CODE END UART9_Init 1 */
+  huart9.Instance = UART9;
+  huart9.Init.BaudRate = 115200;
+  huart9.Init.WordLength = UART_WORDLENGTH_8B;
+  huart9.Init.StopBits = UART_STOPBITS_1;
+  huart9.Init.Parity = UART_PARITY_NONE;
+  huart9.Init.Mode = UART_MODE_TX_RX;
+  huart9.Init.HwFlowCtl = UART_HWCONTROL_RTS_CTS;
+  huart9.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart9.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart9.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart9.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart9, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart9, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART9_Init 2 */
+
+  /* USER CODE END UART9_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
-  __HAL_RCC_DMA2_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
@@ -468,6 +562,9 @@ static void MX_DMA_Init(void)
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
 
 }
 
@@ -483,19 +580,23 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LED_GREEN_Pin|LED_RED_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(USB_FS_PWR_EN_GPIO_Port, USB_FS_PWR_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin, GPIO_PIN_RESET);
@@ -506,8 +607,15 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RMII_MDC_Pin RMII_RXD0_Pin RMII_RXD1_Pin */
-  GPIO_InitStruct.Pin = RMII_MDC_Pin|RMII_RXD0_Pin|RMII_RXD1_Pin;
+  /*Configure GPIO pin : PF10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : RMII_MDC_Pin RMII_RXD1_Pin */
+  GPIO_InitStruct.Pin = RMII_MDC_Pin|RMII_RXD1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -522,12 +630,20 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LED_GREEN_Pin LED_RED_Pin */
-  GPIO_InitStruct.Pin = LED_GREEN_Pin|LED_RED_Pin;
+  /*Configure GPIO pins : PC4 PC9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED_GREEN_Pin */
+  GPIO_InitStruct.Pin = LED_GREEN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED_GREEN_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PE10 */
   GPIO_InitStruct.Pin = GPIO_PIN_10;
@@ -535,13 +651,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RMII_TXD1_Pin */
-  GPIO_InitStruct.Pin = RMII_TXD1_Pin;
+  /*Configure GPIO pins : PB13 PB14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(RMII_TXD1_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : STLK_VCP_RX_Pin STLK_VCP_TX_Pin */
   GPIO_InitStruct.Pin = STLK_VCP_RX_Pin|STLK_VCP_TX_Pin;
@@ -551,12 +667,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : USB_FS_PWR_EN_Pin */
-  GPIO_InitStruct.Pin = USB_FS_PWR_EN_Pin;
+  /*Configure GPIO pin : PD10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(USB_FS_PWR_EN_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_FS_OVCR_Pin */
   GPIO_InitStruct.Pin = USB_FS_OVCR_Pin;
@@ -580,13 +696,21 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF10_OTG1_HS;
   HAL_GPIO_Init(USB_FS_ID_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RMII_TX_EN_Pin RMII_TXD0_Pin */
-  GPIO_InitStruct.Pin = RMII_TX_EN_Pin|RMII_TXD0_Pin;
+  /*Configure GPIO pins : PG9 PG11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : RMII_TXD0_Pin */
+  GPIO_InitStruct.Pin = RMII_TXD0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+  HAL_GPIO_Init(RMII_TXD0_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LED_YELLOW_Pin */
   GPIO_InitStruct.Pin = LED_YELLOW_Pin;
@@ -620,7 +744,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 // *****************************************************************************
-void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef* hi2s2)
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef* hsai_BlockB1)
 // *****************************************************************************
 // Description: Callback for half buffer completion
 // Parameters: i2s handle
@@ -633,7 +757,7 @@ void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef* hi2s2)
 }
 
 // *****************************************************************************
-void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef* hsai_BlockB1)
 // *****************************************************************************
 // Description: Callback for full buffer completion
 // Parameters: i2s handle
@@ -646,11 +770,34 @@ void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
 }
 
 // *****************************************************************************
-static void AppInit(void)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, 
+                               uint16_t receivedBytes) 
+// *****************************************************************************
+// Description: Callback for UART RX
+// Parameters: 
+//   UART_HandleTypeDef *huart9: UART7 handler
+// Returns: nothing
+// *****************************************************************************
+{
+  uartRxCpltFlag = FINISHED;
+}
+
+// *****************************************************************************
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+// *****************************************************************************
+// Description: 
+// Parameters: 
+// Returns: 
+// *****************************************************************************
+{
+  uartTxCpltFlag = FINISHED;
+}
+// *****************************************************************************
+static tErrorCode AppInit(void)
 // *****************************************************************************
 // Description: Initializes structure values with 0
 // Parameters: none
-// Returns: nothing
+// Returns: Error code
 // *****************************************************************************
 {
   uint16_t i, j;
@@ -694,6 +841,27 @@ static void AppInit(void)
 
   // Init convolution channels
   for (i = 0; i < MAX_CONV; i++) convq15[i].channel = CHANNEL_NONE;
+
+  if (RES_OK != DSP_UpdateIIRInstances(filterConfig, IIRf32, IIRq15, IIRq31, 
+  insIIRf32, insIIRq15, insIIRq31, normGain))
+  {appError = ERROR_CODE_15; return RES_ERROR;}
+
+  if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
+                insFIRq15))
+  {appError = ERROR_CODE_16; return RES_ERROR;}
+
+  if (RES_OK != DSP_UpdateConvolutionInstances(convq15))
+  {appError = ERROR_CODE_16; return RES_ERROR;}
+
+  if (RES_OK != CheckParams())
+  {appError = ERROR_CODE_17; return RES_ERROR;}
+
+  // Initialize UART FSM
+  uartSt = IDLE;
+  uartRxCpltFlag = WAITING;
+  uartTxCpltFlag = FINISHED;
+
+  return RES_OK;
 }
 
 // *****************************************************************************
@@ -705,8 +873,8 @@ static tErrorCode CheckParams(void)
 // *****************************************************************************
 {
   if ((4 < DAC_QUANTITY) || (0 > DAC_QUANTITY)) return RES_ERROR_PARAM;
-  if ((4 < ADC_QUANTITY) || (0 > ADC_QUANTITY)) return RES_ERROR_PARAM;
-  if (0 != (BUFFER_SIZE % 4)) return RES_ERROR_PARAM; // Must be a multiple of 4
+  if ((4 < INPUT_QUANTITY) || (0 > INPUT_QUANTITY)) return RES_ERROR_PARAM;
+  if (0 != (BUFFER_SIZE % 8)) return RES_ERROR_PARAM; // Must be a multiple of 8
 
   return RES_OK;
 }
@@ -975,7 +1143,7 @@ static tErrorCode ApplyConvolution(void *inBuf, tConvq15 *pConvq15,
 }
 
 // *****************************************************************************
-static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR, 
+static tErrorCode DecodeData(int32_t *inBuf, void *outBufL, void *outBufR, 
                              tArithmetic bufType)
 // *****************************************************************************
 // Description: Decodes a buffer of PCM data from the PCM1808 ADC
@@ -997,7 +1165,7 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
   switch (bufType)
   {
     case Q15:
-      if (RES_OK != DSP_Int24ToInt16(inBuf, bufSize))
+      if (RES_OK != DSP_Int32ToInt16(inBuf, bufSize))
       {appError = ERROR_CODE_1; return RES_ERROR;}
     
       if (RES_OK != DSP_DecodePCM_Int16(inBuf, (int16_t *)outBufL, 
@@ -1006,21 +1174,15 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
       break;
 
     case Q31:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
-      {appError = ERROR_CODE_1; return RES_ERROR;}
-    
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
                     (int32_t *)outBufR, nSamples)) 
       {appError = ERROR_CODE_2; return RES_ERROR;}  
       break;    
 
     case F32:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
-      {appError = ERROR_CODE_1; return RES_ERROR;}
-    
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
                     (int32_t *)outBufR, nSamples))
-      {appError = ERROR_CODE_2; return RES_ERROR;}  
+      {appError = ERROR_CODE_2; return RES_ERROR;} 
 
       if (RES_OK != DSP_q31_to_f32_arm((int32_t *)outBufL, (float *)outBufL, 
                     nSamples))
@@ -1109,10 +1271,20 @@ static tErrorCode ProcessData(void)
       
     case 1: // Buffer half full, process first half
       
-      // Decode ADC1 from PCM
-      if (RES_OK != DecodeData(&adc[BUF_BEGIN], 
+      // Convert ADC to 32bit
+      if (RES_OK != DSP_Int24ToInt32(&input[INPUT0][BUF_BEGIN], bufSize))
+      {appError = ERROR_CODE_1; return RES_ERROR;}
+
+      // Decode INPUT0 from PCM
+      if (RES_OK != DecodeData(&input[INPUT0][BUF_BEGIN],
                     &general[CHANNEL_0][BUF_BEGIN],
-                    &general[CHANNEL_1][BUF_BEGIN], 
+                    &general[CHANNEL_1][BUF_BEGIN],
+                    Q15)) return RES_ERROR;
+
+      // Decode INPUT1 from PCM
+      if (RES_OK != DecodeData(&input[INPUT1][BUF_BEGIN],
+                    &general[CHANNEL_2][BUF_BEGIN],
+                    &general[CHANNEL_3][BUF_BEGIN],
                     Q15)) return RES_ERROR;
 
       // Normalize channels
@@ -1131,6 +1303,14 @@ static tErrorCode ProcessData(void)
                     convq15, Q15))
       {return RES_ERROR;}
 
+      // Dump and mix channels into CH0 and CH1
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_0][BUF_BEGIN], 
+                   &general[CHANNEL_2][BUF_BEGIN], bufSize, Q15))
+      {return RES_ERROR;}
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_1][BUF_BEGIN], 
+                   &general[CHANNEL_3][BUF_BEGIN], bufSize, Q15))
+      {return RES_ERROR;}
+
       // Encode DAC1 to PCM
       if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_BEGIN], 
                     &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], Q15))
@@ -1140,10 +1320,20 @@ static tErrorCode ProcessData(void)
 
     case 2: // Buffer full, process second half
       
-      // Decode ADC1 from PCM
-      if (RES_OK != DecodeData(&adc[BUFFER_SIZE], 
+      // Convert ADC to 32bit
+      if (RES_OK != DSP_Int24ToInt32(&input[INPUT0][BUFFER_SIZE], bufSize))
+      {appError = ERROR_CODE_1; return RES_ERROR;}
+
+      // Decode INPUT0 from PCM
+      if (RES_OK != DecodeData(&input[INPUT0][BUFFER_SIZE], 
                     &general[CHANNEL_0][BUF_HALF],
                     &general[CHANNEL_1][BUF_HALF], Q15))
+      {return RES_ERROR;}
+
+      // Decode INPUT1 from PCM
+      if (RES_OK != DecodeData(&input[INPUT1][BUFFER_SIZE], 
+                    &general[CHANNEL_2][BUF_HALF],
+                    &general[CHANNEL_3][BUF_HALF], Q15))
       {return RES_ERROR;}
 
       // Normalize channels
@@ -1160,6 +1350,14 @@ static tErrorCode ProcessData(void)
       // Apply convolution
       if (RES_OK != ApplyConvolution(&general[CHANNEL_0][BUF_HALF], 
                     convq15, Q15))
+      {return RES_ERROR;}
+
+      // Dump and mix channels into CH0 and CH1
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_0][BUF_HALF], 
+                   &general[CHANNEL_2][BUF_HALF], bufSize, Q15))
+      {return RES_ERROR;}
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_1][BUF_HALF], 
+                   &general[CHANNEL_3][BUF_HALF], bufSize, Q15))
       {return RES_ERROR;}
 
       // Encode DAC1 to PCM
@@ -1213,6 +1411,79 @@ static tErrorCode CheckConfig(void)
       break;
   }
 
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode ManageUART(void)
+// *****************************************************************************
+// Description: Manages the UART RX/TX actions
+// Parameters: None
+// Returns: Error code
+// *****************************************************************************
+{
+  switch (uartFSM)
+  {
+    case WAIT_RX: //****************** WAIT FOR RX *****************************
+      if (FINISHED == uartRxCpltFlag) // RX Interrupt triggered
+      {
+        if (RES_OK != BT_GetUartSt(&huart9, &uartSt)) // wait for hardware idle
+        {
+          appError = ERROR_CODE_20;
+          return RES_ERROR;
+        }
+        if (IDLE == uartSt)
+        {
+          // NEXT STATE & RESET RX FLAG
+          uartRxCpltFlag = WAITING;
+          uartFSM = NEW_MSG;
+        }
+      }
+      break;
+
+    case NEW_MSG: //************* RX INTERRUPT OCCURRED ************************
+      if (RES_OK != BT_GetStart(uartRx, &(msg.len), &(msg.command))) // Parse start
+      {
+        if (RES_OK != BT_Send_RxFail(uartTx)) return RES_ERROR; // Incorrect start
+      }
+      else // Correct start
+      {
+        if (RES_OK != BT_ParseMsg(uartRx, uartTx, msg.len, msg.command, 
+                      filterConfig, &filterConfigFlag)) return RES_ERROR;
+        if (RES_OK != BT_Send_Ack(uartTx)) return RES_ERROR; 
+      }
+      // NEXT STATE & ENABLE TX INTERRUPT
+      uartFSM = SENDING;
+      uartTxCpltFlag = WAITING;
+      if (HAL_OK != HAL_UART_Transmit_IT(&huart9, (uint8_t *)uartTx, uartTx[0]))
+      { 
+        appError = ERROR_CODE_21;
+        return RES_ERROR;
+      }
+      break;
+
+    case SENDING: //************ SEND RESPONSE *********************************
+      if (FINISHED == uartTxCpltFlag)  //TX interrupt triggered
+      {
+        if (RES_OK != BT_GetUartSt(&huart9, &uartSt)) // wait for hardware idle
+        { 
+          appError = ERROR_CODE_22;
+          return RES_ERROR;
+        }
+        if (IDLE == uartSt)
+        {
+          if (HAL_OK != HAL_UARTEx_ReceiveToIdle_IT(&huart9, (uint8_t*)pUartRx, 
+                                           UART_CHUNK_SIZE))
+          {appError = ERROR_CODE_23;} // UART HW STATUS ERROR, 2MANY MSGs 
+          else uartFSM = IDLE; // Go to idle state
+        }
+      }
+      break;
+
+    default: // UNKNOWN FSM STATE
+      appError = ERROR_CODE_24;
+      return RES_ERROR;
+  }
   return RES_OK;
 }
 
