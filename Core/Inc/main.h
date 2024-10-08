@@ -31,24 +31,11 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stm32h7xx_hal_rcc.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-typedef union
-{
-  float f32;
-  int16_t q15;
-  int32_t q31;
-} tUnionBuf;
-
-typedef enum
-{
-  F32,
-  Q15,
-  Q31
-} tArithmetic;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -60,8 +47,6 @@ typedef enum
 /* USER CODE BEGIN EM */
 
 /* USER CODE END EM */
-
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
@@ -82,22 +67,14 @@ void Error_Handler(void);
 #define RMII_MDIO_GPIO_Port GPIOA
 #define RMII_CRS_DV_Pin GPIO_PIN_7
 #define RMII_CRS_DV_GPIO_Port GPIOA
-#define RMII_RXD0_Pin GPIO_PIN_4
-#define RMII_RXD0_GPIO_Port GPIOC
 #define RMII_RXD1_Pin GPIO_PIN_5
 #define RMII_RXD1_GPIO_Port GPIOC
 #define LED_GREEN_Pin GPIO_PIN_0
 #define LED_GREEN_GPIO_Port GPIOB
-#define RMII_TXD1_Pin GPIO_PIN_13
-#define RMII_TXD1_GPIO_Port GPIOB
-#define LED_RED_Pin GPIO_PIN_14
-#define LED_RED_GPIO_Port GPIOB
 #define STLK_VCP_RX_Pin GPIO_PIN_8
 #define STLK_VCP_RX_GPIO_Port GPIOD
 #define STLK_VCP_TX_Pin GPIO_PIN_9
 #define STLK_VCP_TX_GPIO_Port GPIOD
-#define USB_FS_PWR_EN_Pin GPIO_PIN_10
-#define USB_FS_PWR_EN_GPIO_Port GPIOD
 #define USB_FS_OVCR_Pin GPIO_PIN_7
 #define USB_FS_OVCR_GPIO_Port GPIOG
 #define USB_FS_VBUS_Pin GPIO_PIN_9
@@ -108,8 +85,6 @@ void Error_Handler(void);
 #define SWDIO_GPIO_Port GPIOA
 #define SWCLK_Pin GPIO_PIN_14
 #define SWCLK_GPIO_Port GPIOA
-#define RMII_TX_EN_Pin GPIO_PIN_11
-#define RMII_TX_EN_GPIO_Port GPIOG
 #define RMII_TXD0_Pin GPIO_PIN_13
 #define RMII_TXD0_GPIO_Port GPIOG
 #define SWO_Pin GPIO_PIN_3

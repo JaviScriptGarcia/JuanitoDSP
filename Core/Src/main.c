@@ -24,12 +24,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <limits.h>
+#include "bluetooth.h"
 #ifndef DSP_H
 #include "dsp.h"
 #endif
 #ifndef GLOBAL_H
 #include "global.h"
 #endif
+
 // #include "arm_math.h"
 
 /* USER CODE END Includes */
@@ -43,8 +45,8 @@
 /* USER CODE BEGIN PD */
 #define BUF_BEGIN 0
 #define BUF_HALF (BUFFER_SIZE/2)
-#define TIMER_RES 8 // Timer resolution multiplier
-
+#define TIMER_RES 8 // Timer events per sample (resolution)
+#define HEALTH_CHECK_PERIOD 200
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,70 +58,115 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-I2S_HandleTypeDef hi2s2;
 I2S_HandleTypeDef hi2s3;
-DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
 
-TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim16;
+LPTIM_HandleTypeDef hlptim2;
+
+SAI_HandleTypeDef hsai_BlockA1;
+SAI_HandleTypeDef hsai_BlockB1;
+DMA_HandleTypeDef hdma_sai1_a;
+DMA_HandleTypeDef hdma_sai1_b;
+
+UART_HandleTypeDef huart9;
 
 /* USER CODE BEGIN PV */
-// *****************************************************************************
-// INPUT, OUTPUT AND PROCESSING BUFFERS
-//  RX buffer (Stereo PCM)
-static uint32_t adc[BUFFER_SIZE*2] SET_TO_RAMD2;
 
-//  TX buffer (Stereo PCM)
-static int16_t dac[BUFFER_SIZE*2] SET_TO_RAMD2;
+typedef union // Union for mixed-type buffers
+{
+  float f32;
+  int16_t q15;
+  int32_t q31;
+} tUnionBuf;
 
-//  Processing buffers
-static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE] SET_TO_ITCMRAM; 
-// *****************************************************************************
+static enum
+{
+  INPUT0 = 0,
+  INPUT1 = 1,
+  INPUT2 = 2,
+  INPUT3 = 3
+}inputID;
 
-// *****************************************************************************
-// Convolution instances
-static tConvq15 convq15[MAX_CONV] SET_TO_DTCMRAM; 
-// *****************************************************************************
+static enum
+{
+  OUTPUT0 = 0,
+  OUTPUT1 = 1,
+  OUTPUT2 = 2,
+  OUTPUT3 = 3
+}outputID;
 
-// *****************************************************************************
-// FIR instances
+// ****************** INPUT, OUTPUT AND PROCESSING BUFFERS *********************
+static int32_t input[INPUT_QUANTITY][BUFFER_SIZE*2] SET_TO_RAMD2;  //  IN buffer (Stereo PCM)
+static int16_t output[OUTPUT_QUANTITY][BUFFER_SIZE*2] SET_TO_RAMD2;//  OUT buffer (Stereo PCM)
+static tUnionBuf general[MAX_CHANNELS][BUFFER_SIZE] SET_TO_ITCMRAM;//  General channels (MONO)
+
+// ***************** Convolution instances *************************************
+static tConvq15 convq15[MAX_CONV] SET_TO_DTCMRAM;
+
+// ***************** FIR instances *********************************************
 static tFIRf32 FIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
 static tFIRq15 FIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
 
-// FIR arm_math.h instances
+// ***************** FIR arm_math.h instances **********************************
 static arm_fir_instance_f32 insFIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
 static arm_fir_instance_q15 insFIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
-// *****************************************************************************
 
-// *****************************************************************************
-// System configuration structure
-static tParamConfig filterConfig[MAX_FILTERS];  
-
-// Anti saturation pre-IIR gain
+// ***************** Anti saturation pre-IIR gain ******************************
 static tGain normGain[MAX_CHANNELS] SET_TO_DTCMRAM;
 
-// IIR 2nd order biquads
-static tIIRf32 IIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
-static tIIRq15 IIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
-static tIIRq31 IIRq31[MAX_FILTERS] SET_TO_DTCMRAM;
+// ***************** IIR 2nd order biquads *************************************
+static tIIRf32 IIRf32[MAX_FILTERS] SET_TO_DTCMRAM;    // IIR 2nd order instance
+static tIIRq15 IIRq15[MAX_FILTERS] SET_TO_DTCMRAM;    // IIR 2nd order instance
+static tIIRq31 IIRq31[MAX_FILTERS] SET_TO_DTCMRAM;    // IIR 2nd order instance
+static tFilterConfig filterConfig[MAX_FILTERS]; // IIR 2nd order config params
 
-// IIR arm_math.h 2nd order biquads pointer instance
+// ************** IIR arm_math.h 2nd order biquads pointer instance ************
 static arm_biquad_cascade_df2T_instance_f32 insIIRf32[MAX_FILTERS] SET_TO_DTCMRAM;
 static arm_biquad_casd_df1_inst_q15 insIIRq15[MAX_FILTERS] SET_TO_DTCMRAM;
 static arm_biquad_casd_df1_inst_q31 insIIRq31[MAX_FILTERS] SET_TO_DTCMRAM;
-// *****************************************************************************
 
-// *****************************************************************************
-// APP LOGIC STATE VARIABLES
+// ***************** BT module UART buffers & variables ************************
+static SET_TO_DTCMRAM char uartRx[UART_CHUNK_SIZE];
+static SET_TO_DTCMRAM char uartTx[UART_CHUNK_SIZE];
+static SET_TO_DTCMRAM char *pUartRx = &uartRx[0];
+static SET_TO_DTCMRAM tUartSt uartSt;
+static SET_TO_DTCMRAM uint16_t bytesToCpltUartRx = 0;
+
+static struct
+{
+  uint16_t len;
+  tRxCommand command;
+} msg;
+
+static enum 
+{
+  WAIT_RX,
+  NEW_MSG,
+  SENDING
+} uartFSM;
+
+static enum
+{
+  WAITING,
+  FINISHED
+} uartRxCpltFlag, uartTxCpltFlag;
+
+// ********************** APP LOGIC STATE VARIABLES ****************************
 static SET_TO_DTCMRAM tErrorCode appError;
-static SET_TO_DTCMRAM uint8_t dataReadyFlag = 0; // Buffer state, 0 = empty, 1 = half, 2 = full
 static SET_TO_DTCMRAM uint8_t filterConfigFlag = 0; // 0 = configured, 1 = new config received
 static SET_TO_DTCMRAM uint16_t timerCount = 0;   // Performance monitor timer
 static SET_TO_DTCMRAM float cpuUsage = 0;        // CPU real-time usage (%)
+static uint8_t cpuOverload = 0;   // Active when processing couldnt be completed in time
 static SET_TO_DTCMRAM uint16_t nSamples = BUF_HALF;
 static SET_TO_DTCMRAM uint16_t bufSize = BUFFER_SIZE;
+static SET_TO_DTCMRAM uint16_t healthCheckCounter = 0;
 
+static enum
+{
+  EMPTY,
+  HALF_FULL,
+  FULL
+}inputBufCplt; // STATES OF AUDIO PROCESSING FINITE STATE MACHINE
 
 // *****************************************************************************
 
@@ -129,16 +176,18 @@ static SET_TO_DTCMRAM uint16_t bufSize = BUFFER_SIZE;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
-static void MX_TIM16_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
+static void MX_SAI1_Init(void);
+static void MX_UART9_Init(void);
+static void MX_LPTIM2_Init(void);
 /* USER CODE BEGIN PFP */
-static void AppInit(void);
+static tErrorCode AppInit(void);
 static void CacheInit(void);
 static tErrorCode CheckParams(void);
 static tErrorCode ProcessData(void);
 static tErrorCode CheckConfig(void);
+static tErrorCode ManageUART(void);
+static tErrorCode CheckSysHealth(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -153,6 +202,7 @@ static tErrorCode CheckConfig(void);
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -172,21 +222,6 @@ int main(void)
   /* USER CODE BEGIN SysInit */
   AppInit();
   DSP_TestFilters(filterConfig);
-  
-  if (RES_OK != DSP_UpdateIIRs(filterConfig, IIRf32, IIRq15, IIRq31, insIIRf32,
-                insIIRq15, insIIRq31, normGain))
-  {appError = ERROR_CODE_15; goto error;}
-
-  if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
-                insFIRq15))
-  {appError = ERROR_CODE_16; goto error;}
-
-  if (RES_OK != DSP_UpdateConvolutionInstances(convq15))
-  {appError = ERROR_CODE_16; goto error;}
-
-  if (RES_OK != CheckParams())
-  {appError = ERROR_CODE_17; goto error;}
-
   CacheInit();
 
   /* USER CODE END SysInit */
@@ -194,24 +229,42 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_TIM16_Init();
-  MX_TIM3_Init();
-  MX_I2S2_Init();
   MX_I2S3_Init();
+  MX_SAI1_Init();
+  MX_UART9_Init();
+  MX_LPTIM2_Init();
   /* USER CODE BEGIN 2 */
-    HAL_TIM_Base_Start_IT(&htim16);
-    HAL_TIM_Base_Start_IT(&htim3);
+    // **************** Init DMA for audio IOs *********************************
+    // Wired input
+    HAL_SAI_Receive_DMA(&hsai_BlockB1, (uint8_t*) &input[INPUT0][BUF_BEGIN], 
+                        BUFFER_SIZE * 2);
+    // Bluetooth input
+    HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t*) &input[INPUT1][BUF_BEGIN], 
+                        BUFFER_SIZE * 2);
+    // Wired output
+    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) &output[OUTPUT0][BUF_BEGIN],
+                         BUFFER_SIZE * 2);
+                         
+    // **************** INIT UART AND BT COMMUNICATION *************************
+    HAL_UARTEx_ReceiveToIdle_IT(&huart9, (uint8_t*)uartRx, UART_CHUNK_SIZE);
+    // BT_Init(); // Initialize BT communication
 
-    HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*) dac, BUFFER_SIZE * 2);
-    HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*) adc, BUFFER_SIZE * 2);
+    // **************** INIT TIMER COUNTER FOR CPU USAGE MONITOR ***************
+    HAL_LPTIM_Counter_Start(&hlptim2, TIMER_RES * BUF_HALF);
+
+    // **************** INIT APP STATE VARIABLES *******************************
+    if (RES_OK != AppInit()) goto error;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     while (1)
     {
-      if (RES_OK != CheckConfig()) goto error;
-      if (RES_OK != ProcessData()) goto error;
+      if (RES_OK != ManageUART())     goto error;
+      if (RES_OK != CheckConfig())    goto error;
+      if (RES_OK != CheckSysHealth()) goto error;
+      if (RES_OK != ProcessData())    goto error;
     }
     /* USER CODE END WHILE */
 
@@ -243,15 +296,16 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
   RCC_OscInitStruct.PLL.PLLN = 68;
   RCC_OscInitStruct.PLL.PLLP = 1;
-  RCC_OscInitStruct.PLL.PLLQ = 8;
-  RCC_OscInitStruct.PLL.PLLR = 8;
+  RCC_OscInitStruct.PLL.PLLQ = 3;
+  RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 6144;
@@ -268,52 +322,16 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV16;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV16;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV16;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
-  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSE, RCC_MCODIV_1);
-}
-
-/**
-  * @brief I2S2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2S2_Init(void)
-{
-
-  /* USER CODE BEGIN I2S2_Init 0 */
-
-  /* USER CODE END I2S2_Init 0 */
-
-  /* USER CODE BEGIN I2S2_Init 1 */
-
-  /* USER CODE END I2S2_Init 1 */
-  hi2s2.Instance = SPI2;
-  hi2s2.Init.Mode = I2S_MODE_MASTER_RX;
-  hi2s2.Init.Standard = I2S_STANDARD_MSB;
-  hi2s2.Init.DataFormat = I2S_DATAFORMAT_24B;
-  hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
-  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_48K;
-  hi2s2.Init.CPOL = I2S_CPOL_LOW;
-  hi2s2.Init.FirstBit = I2S_FIRSTBIT_MSB;
-  hi2s2.Init.WSInversion = I2S_WS_INVERSION_DISABLE;
-  hi2s2.Init.Data24BitAlignment = I2S_DATA_24BIT_ALIGNMENT_RIGHT;
-  hi2s2.Init.MasterKeepIOState = I2S_MASTER_KEEP_IO_STATE_DISABLE;
-  if (HAL_I2S_Init(&hi2s2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2S2_Init 2 */
-
-  /* USER CODE END I2S2_Init 2 */
-
+  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSI48, RCC_MCODIV_1);
 }
 
 /**
@@ -353,100 +371,135 @@ static void MX_I2S3_Init(void)
 }
 
 /**
-  * @brief TIM3 Initialization Function
+  * @brief LPTIM2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_TIM3_Init(void)
+static void MX_LPTIM2_Init(void)
 {
 
-  /* USER CODE BEGIN TIM3_Init 0 */
+  /* USER CODE BEGIN LPTIM2_Init 0 */
 
-  /* USER CODE END TIM3_Init 0 */
+  /* USER CODE END LPTIM2_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
+  /* USER CODE BEGIN LPTIM2_Init 1 */
 
-  /* USER CODE BEGIN TIM3_Init 1 */
+  /* USER CODE END LPTIM2_Init 1 */
+  hlptim2.Instance = LPTIM2;
+  hlptim2.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
+  hlptim2.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV1;
+  hlptim2.Init.UltraLowPowerClock.Polarity = LPTIM_CLOCKPOLARITY_RISING;
+  hlptim2.Init.UltraLowPowerClock.SampleTime = LPTIM_CLOCKSAMPLETIME_DIRECTTRANSITION;
+  hlptim2.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
+  hlptim2.Init.OutputPolarity = LPTIM_OUTPUTPOLARITY_HIGH;
+  hlptim2.Init.UpdateMode = LPTIM_UPDATE_IMMEDIATE;
+  hlptim2.Init.CounterSource = LPTIM_COUNTERSOURCE_EXTERNAL;
+  hlptim2.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
+  hlptim2.Init.Input2Source = LPTIM_INPUT2SOURCE_GPIO;
+  if (HAL_LPTIM_Init(&hlptim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN LPTIM2_Init 2 */
 
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 1;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV2;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_TRIGGER;
-  sSlaveConfig.InputTrigger = TIM_TS_ITR0;
-  if (HAL_TIM_SlaveConfigSynchro(&htim3, &sSlaveConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
+  /* USER CODE END LPTIM2_Init 2 */
 
 }
 
 /**
-  * @brief TIM16 Initialization Function
+  * @brief SAI1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_TIM16_Init(void)
+static void MX_SAI1_Init(void)
 {
 
-  /* USER CODE BEGIN TIM16_Init 0 */
+  /* USER CODE BEGIN SAI1_Init 0 */
 
-  /* USER CODE END TIM16_Init 0 */
+  /* USER CODE END SAI1_Init 0 */
 
-  /* USER CODE BEGIN TIM16_Init 1 */
+  /* USER CODE BEGIN SAI1_Init 1 */
 
-  /* USER CODE END TIM16_Init 1 */
-  htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 48-1;
-  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 1;
-  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim16.Init.RepetitionCounter = 0;
-  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  /* USER CODE END SAI1_Init 1 */
+  hsai_BlockA1.Instance = SAI1_Block_A;
+  hsai_BlockA1.Init.AudioMode = SAI_MODEMASTER_RX;
+  hsai_BlockA1.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
+  hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
+  if (HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_32BIT, 2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM16_Init 2 */
+  hsai_BlockB1.Instance = SAI1_Block_B;
+  hsai_BlockB1.Init.AudioMode = SAI_MODEMASTER_RX;
+  hsai_BlockB1.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockB1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
+  hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockB1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockB1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockB1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockB1.Init.CompandingMode = SAI_NOCOMPANDING;
+  if (HAL_SAI_InitProtocol(&hsai_BlockB1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_32BIT, 2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SAI1_Init 2 */
 
-  /* USER CODE END TIM16_Init 2 */
+  /* USER CODE END SAI1_Init 2 */
+
+}
+
+/**
+  * @brief UART9 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART9_Init(void)
+{
+
+  /* USER CODE BEGIN UART9_Init 0 */
+
+  /* USER CODE END UART9_Init 0 */
+
+  /* USER CODE BEGIN UART9_Init 1 */
+
+  /* USER CODE END UART9_Init 1 */
+  huart9.Instance = UART9;
+  huart9.Init.BaudRate = 115200;
+  huart9.Init.WordLength = UART_WORDLENGTH_8B;
+  huart9.Init.StopBits = UART_STOPBITS_1;
+  huart9.Init.Parity = UART_PARITY_NONE;
+  huart9.Init.Mode = UART_MODE_TX_RX;
+  huart9.Init.HwFlowCtl = UART_HWCONTROL_RTS;
+  huart9.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart9.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart9.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart9.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart9, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart9, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART9_Init 2 */
+
+  /* USER CODE END UART9_Init 2 */
 
 }
 
@@ -457,15 +510,16 @@ static void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
@@ -481,19 +535,23 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LED_GREEN_Pin|LED_RED_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(USB_FS_PWR_EN_GPIO_Port, USB_FS_PWR_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin, GPIO_PIN_RESET);
@@ -504,8 +562,15 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RMII_MDC_Pin RMII_RXD0_Pin RMII_RXD1_Pin */
-  GPIO_InitStruct.Pin = RMII_MDC_Pin|RMII_RXD0_Pin|RMII_RXD1_Pin;
+  /*Configure GPIO pin : PF10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : RMII_MDC_Pin RMII_RXD1_Pin */
+  GPIO_InitStruct.Pin = RMII_MDC_Pin|RMII_RXD1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -520,12 +585,28 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LED_GREEN_Pin LED_RED_Pin */
-  GPIO_InitStruct.Pin = LED_GREEN_Pin|LED_RED_Pin;
+  /*Configure GPIO pin : PA6 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PC4 PC9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED_GREEN_Pin */
+  GPIO_InitStruct.Pin = LED_GREEN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED_GREEN_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PE10 */
   GPIO_InitStruct.Pin = GPIO_PIN_10;
@@ -533,13 +614,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RMII_TXD1_Pin */
-  GPIO_InitStruct.Pin = RMII_TXD1_Pin;
+  /*Configure GPIO pins : PB13 PB14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(RMII_TXD1_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : STLK_VCP_RX_Pin STLK_VCP_TX_Pin */
   GPIO_InitStruct.Pin = STLK_VCP_RX_Pin|STLK_VCP_TX_Pin;
@@ -549,12 +630,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : USB_FS_PWR_EN_Pin */
-  GPIO_InitStruct.Pin = USB_FS_PWR_EN_Pin;
+  /*Configure GPIO pin : PD10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(USB_FS_PWR_EN_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_FS_OVCR_Pin */
   GPIO_InitStruct.Pin = USB_FS_OVCR_Pin;
@@ -578,13 +659,21 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF10_OTG1_HS;
   HAL_GPIO_Init(USB_FS_ID_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RMII_TX_EN_Pin RMII_TXD0_Pin */
-  GPIO_InitStruct.Pin = RMII_TX_EN_Pin|RMII_TXD0_Pin;
+  /*Configure GPIO pins : PG9 PG11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : RMII_TXD0_Pin */
+  GPIO_InitStruct.Pin = RMII_TXD0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+  HAL_GPIO_Init(RMII_TXD0_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LED_YELLOW_Pin */
   GPIO_InitStruct.Pin = LED_YELLOW_Pin;
@@ -599,54 +688,63 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 // *****************************************************************************
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-// *****************************************************************************
-// Description: Callback for timers
-// Parameters: timer handler
-// Returns: nothing
-// *****************************************************************************
-{
-  if(htim->Instance == TIM16)
-  {
-    timerCount++; // Performance monitor increase, Freq = Fs * TIMER_RES
-    // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);         // Toggle LED red
-  }
-  if(htim->Instance == TIM3)
-  {
-    // HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);            // Toggle LED red
-  }
-}
-
-// *****************************************************************************
-void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef* hi2s2)
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai_BlockB1)
 // *****************************************************************************
 // Description: Callback for half buffer completion
 // Parameters: i2s handle
 // Returns: nothing
 // *****************************************************************************
 {
-    HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);
-    dataReadyFlag = 1;
+    // HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);
+    if (EMPTY == inputBufCplt) inputBufCplt = HALF_FULL;
+    else cpuOverload = 1;
 }
 
 // *****************************************************************************
-void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef* hi2s2)
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai_BlockB1)
 // *****************************************************************************
 // Description: Callback for full buffer completion
 // Parameters: i2s handle
 // Returns: nothing
 // *****************************************************************************
 {
-    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
-    dataReadyFlag = 2;
+    // HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
+    if (EMPTY == inputBufCplt) inputBufCplt = FULL;
+    else cpuOverload = 1;
 }
 
 // *****************************************************************************
-static void AppInit(void)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, 
+                               uint16_t receivedBytes) 
 // *****************************************************************************
-// Description: Initializes structure values with 0
-// Parameters: none
+// Description: Callback for UART RX
+// Parameters: 
+//   *huart: UART handler.
+//   receivedBytes: amount of bytes in the received frame.
 // Returns: nothing
+// *****************************************************************************
+{
+  uartRxCpltFlag = FINISHED;
+}
+
+// *****************************************************************************
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+// *****************************************************************************
+// Description: Callback for UART TX
+// Parameters: 
+//   *huart: UART handler.
+// Returns: Nothing.
+// *****************************************************************************
+{
+  uartTxCpltFlag = FINISHED;
+}
+
+// *****************************************************************************
+static tErrorCode AppInit(void)
+// *****************************************************************************
+// Description: Initializes logic variables and structure values with 0
+// Parameters: none
+// Returns: Error code
 // *****************************************************************************
 {
   uint16_t i, j;
@@ -690,6 +788,27 @@ static void AppInit(void)
 
   // Init convolution channels
   for (i = 0; i < MAX_CONV; i++) convq15[i].channel = CHANNEL_NONE;
+
+  if (RES_OK != DSP_UpdateIIRs(filterConfig, IIRf32, IIRq15, IIRq31, 
+  insIIRf32, insIIRq15, insIIRq31, normGain))
+  {appError = ERROR_CODE_15; return RES_ERROR;}
+
+  if (RES_OK != DSP_UpdateFIRInstances(filterConfig, FIRf32, FIRq15, insFIRf32,
+                insFIRq15))
+  {appError = ERROR_CODE_16; return RES_ERROR;}
+
+  if (RES_OK != DSP_UpdateConvolutionInstances(convq15))
+  {appError = ERROR_CODE_16; return RES_ERROR;}
+
+  if (RES_OK != CheckParams())
+  {appError = ERROR_CODE_17; return RES_ERROR;}
+
+  // Initialize UART FSM
+  uartSt = IDLE;
+  uartRxCpltFlag = WAITING;
+  uartTxCpltFlag = FINISHED;
+
+  return RES_OK;
 }
 
 // *****************************************************************************
@@ -700,9 +819,9 @@ static tErrorCode CheckParams(void)
 // Returns: Error code.
 // *****************************************************************************
 {
-  if ((4 < DAC_QUANTITY) || (0 > DAC_QUANTITY)) return RES_ERROR_PARAM;
-  if ((4 < ADC_QUANTITY) || (0 > ADC_QUANTITY)) return RES_ERROR_PARAM;
-  if (0 != (BUFFER_SIZE % 4)) return RES_ERROR_PARAM; // Must be a multiple of 4
+  if ((4 < OUTPUT_QUANTITY) || (0 > OUTPUT_QUANTITY)) return RES_ERROR_PARAM;
+  if ((4 < INPUT_QUANTITY) || (0 > INPUT_QUANTITY)) return RES_ERROR_PARAM;
+  if (0 != (BUFFER_SIZE % 8)) return RES_ERROR_PARAM; // Must be a multiple of 8
 
   return RES_OK;
 }
@@ -971,7 +1090,7 @@ static tErrorCode ApplyConvolution(void *inBuf, tConvq15 *pConvq15,
 }
 
 // *****************************************************************************
-static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR, 
+static tErrorCode DecodeData(int32_t *inBuf, void *outBufL, void *outBufR, 
                              tArithmetic bufType)
 // *****************************************************************************
 // Description: Decodes a buffer of PCM data from the PCM1808 ADC
@@ -993,7 +1112,7 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
   switch (bufType)
   {
     case Q15:
-      if (RES_OK != DSP_Int24ToInt16(inBuf, bufSize))
+      if (RES_OK != DSP_Int32ToInt16(inBuf, bufSize))
       {appError = ERROR_CODE_1; return RES_ERROR;}
     
       if (RES_OK != DSP_DecodePCM_Int16(inBuf, (int16_t *)outBufL, 
@@ -1002,21 +1121,15 @@ static tErrorCode DecodeData(uint32_t *inBuf, void *outBufL, void *outBufR,
       break;
 
     case Q31:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
-      {appError = ERROR_CODE_1; return RES_ERROR;}
-    
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
                     (int32_t *)outBufR, nSamples)) 
       {appError = ERROR_CODE_2; return RES_ERROR;}  
       break;    
 
     case F32:
-      if (RES_OK != DSP_Int24ToInt32(inBuf, bufSize))
-      {appError = ERROR_CODE_1; return RES_ERROR;}
-    
       if (RES_OK != DSP_DecodePCM_Int32(inBuf, (int32_t *)outBufL, 
                     (int32_t *)outBufR, nSamples))
-      {appError = ERROR_CODE_2; return RES_ERROR;}  
+      {appError = ERROR_CODE_2; return RES_ERROR;} 
 
       if (RES_OK != DSP_q31_to_f32_arm((int32_t *)outBufL, (float *)outBufL, 
                     nSamples))
@@ -1093,26 +1206,30 @@ static tErrorCode EncodeData(void *inBufL, void *inBufR, int16_t *outBuf,
 static tErrorCode ProcessData(void)
 // *****************************************************************************
 // Description: Processsing function. FSM managing application functions.
-// Parameters: none
-// Returns: error code
+// Parameters: None.
+// Returns: Error code.
 // *****************************************************************************
 {
-
-  switch (dataReadyFlag)
+  switch (inputBufCplt)
   {
-    case 0: // Buffer still receiving data
+    case EMPTY: // Buffer still receiving data
       return RES_OK;
       
-    case 1: // Buffer half full, process first half
-    cpuUsage = 100.0 * (1 - ((float)timerCount / (float)(BUF_HALF * TIMER_RES)));
-    htim16.Instance->CR1 &= ~TIM_CR1_CEN; // Stop timer
+    case HALF_FULL: // Buffer half full, process first half
+      hlptim2.Instance->CR |= LPTIM_CR_COUNTRST_Msk;
 
-      // Decode ADC1 from PCM
-      if (RES_OK != DecodeData(&adc[BUF_BEGIN], 
+      // Decode INPUT0 from PCM
+      if (RES_OK != DecodeData(&input[INPUT0][BUF_BEGIN],
                     &general[CHANNEL_0][BUF_BEGIN],
-                    &general[CHANNEL_1][BUF_BEGIN], 
+                    &general[CHANNEL_1][BUF_BEGIN],
                     Q15)) return RES_ERROR;
-      
+
+      // Decode INPUT1 from PCM
+      if (RES_OK != DecodeData(&input[INPUT1][BUF_BEGIN],
+                    &general[CHANNEL_2][BUF_BEGIN],
+                    &general[CHANNEL_3][BUF_BEGIN],
+                    Q15)) return RES_ERROR;
+
       // Normalize channels
       if (RES_OK != NormalizeChannels(&general[CHANNEL_0][BUF_BEGIN], 
                                       &normGain[CHANNEL_0], Q15))
@@ -1129,27 +1246,37 @@ static tErrorCode ProcessData(void)
                     convq15, Q15))
       {return RES_ERROR;}
 
-      // Encode DAC1 to PCM
-      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_BEGIN], 
-                    &general[CHANNEL_1][BUF_BEGIN], &dac[BUF_BEGIN], Q15))
+      // Dump and mix channels into CH0 and CH1
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_0][BUF_BEGIN], 
+                   &general[CHANNEL_2][BUF_BEGIN], bufSize, Q15))
+      {return RES_ERROR;}
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_1][BUF_BEGIN], 
+                   &general[CHANNEL_3][BUF_BEGIN], bufSize, Q15))
       {return RES_ERROR;}
 
-      SCB_CleanInvalidateDCache();
-      htim16.Instance->CR1 |= TIM_CR1_CEN; // Resume timer
-      timerCount = 0; // Performance monitor reset counter
+      // Encode CH0&1 to OUTPUT0
+      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_BEGIN], 
+                    &general[CHANNEL_1][BUF_BEGIN], &output[OUTPUT0][BUF_BEGIN],
+                    Q15))
+      {return RES_ERROR;}
         break;
 
-    case 2: // Buffer full, process second half
-    cpuUsage = 100.0 * (1 - ((float)timerCount / (float)(BUF_HALF * TIMER_RES)));
-    htim16.Instance->CR1 &= ~TIM_CR1_CEN; // Stop timer
+    case FULL: // Buffer full, process second half
+      hlptim2.Instance->CR |= LPTIM_CR_COUNTRST_Msk;
 
-      // Decode ADC1 from PCM
-      if (RES_OK != DecodeData(&adc[BUFFER_SIZE], 
+      // Decode INPUT0 to CH 0&1
+      if (RES_OK != DecodeData(&input[INPUT0][BUFFER_SIZE], 
                     &general[CHANNEL_0][BUF_HALF],
                     &general[CHANNEL_1][BUF_HALF], Q15))
       {return RES_ERROR;}
 
-      // Normalize channels
+      // Decode INPUT1 to CH2&3
+      if (RES_OK != DecodeData(&input[INPUT1][BUFFER_SIZE], 
+                    &general[CHANNEL_2][BUF_HALF],
+                    &general[CHANNEL_3][BUF_HALF], Q15))
+      {return RES_ERROR;}
+
+      // Normalize all channels
       if (RES_OK != NormalizeChannels(&general[CHANNEL_0][BUF_HALF], 
                                       &normGain[CHANNEL_0], Q15))
       {return RES_ERROR;}
@@ -1165,23 +1292,31 @@ static tErrorCode ProcessData(void)
                     convq15, Q15))
       {return RES_ERROR;}
 
-      // Encode DAC1 to PCM
-      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_HALF], 
-                    &general[CHANNEL_1][BUF_HALF], &dac[BUFFER_SIZE], Q15))
+      // Dump and mix channels into CH0 and CH1
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_0][BUF_HALF], 
+                   &general[CHANNEL_2][BUF_HALF], bufSize, Q15))
+      {return RES_ERROR;}
+      if (RES_OK != DSP_SumChannel(&general[CHANNEL_1][BUF_HALF], 
+                   &general[CHANNEL_3][BUF_HALF], bufSize, Q15))
       {return RES_ERROR;}
 
-      SCB_CleanInvalidateDCache();
-      htim16.Instance->CR1 |= TIM_CR1_CEN; // Resume timer
-      timerCount = 0; // Performance monitor reset counter
+      // Encode CH0&1 to OUTPUT0
+      if (RES_OK != EncodeData(&general[CHANNEL_0][BUF_HALF], 
+                    &general[CHANNEL_1][BUF_HALF], &output[OUTPUT0][BUFFER_SIZE],
+                    Q15))
+      {return RES_ERROR;}
         break;
     
     default:
       appError = ERROR_CODE_14;
       return RES_ERROR;
-        break;
   }
 
-  dataReadyFlag = 0;
+  SCB_CleanInvalidateDCache();
+  healthCheckCounter++;
+  timerCount = hlptim2.Instance->CNT;
+  cpuUsage = 100.0 * ((float)timerCount / (float)(BUF_HALF * TIMER_RES));
+  inputBufCplt = EMPTY;
   return RES_OK;
 }
 
@@ -1189,8 +1324,8 @@ static tErrorCode ProcessData(void)
 static tErrorCode CheckConfig(void)
 // *****************************************************************************
 // Description: Checks if filter config changed and configures filters if true
-// Parameters: none
-// Returns: error code
+// Parameters: None.
+// Returns: Error code.
 // *****************************************************************************
 {
   switch (filterConfigFlag)
@@ -1216,6 +1351,98 @@ static tErrorCode CheckConfig(void)
       return RES_ERROR;
       break;
   }
+
+  return RES_OK;
+}
+
+// *****************************************************************************
+tErrorCode ManageUART(void)
+// *****************************************************************************
+// Description: Manages the UART RX/TX actions.
+// Parameters: None.
+// Returns: Error code.
+// *****************************************************************************
+{
+  switch (uartFSM)
+  {
+    case WAIT_RX: //****************** WAIT FOR RX *****************************
+      if (FINISHED == uartRxCpltFlag) // RX Interrupt triggered
+      {
+        if (RES_OK != BT_GetUartSt(&huart9, &uartSt)) // wait for hardware idle
+        {
+          appError = ERROR_CODE_20;
+          return RES_ERROR;
+        }
+        if (IDLE == uartSt) // NEXT STATE & RESET RX FLAG
+        {
+          uartRxCpltFlag = WAITING;
+          uartFSM = NEW_MSG;
+        }
+      }
+      break;
+
+    case NEW_MSG: //************* RX INTERRUPT OCCURRED ************************
+      if (RES_OK != BT_GetStart(uartRx, &(msg.len), &(msg.command))) // Parse start
+      {
+        if (RES_OK != BT_Send_RxFail(uartTx)) return RES_ERROR; // Incorrect start
+      }
+      else // Correct start
+      {
+        if (RES_OK != BT_ParseMsg(uartRx, uartTx, msg.len, msg.command, 
+                      filterConfig, &filterConfigFlag)) return RES_ERROR;
+        if (RES_OK != BT_Send_Ack(uartTx)) return RES_ERROR; 
+      }
+      // NEXT STATE & ENABLE TX INTERRUPT
+      uartFSM = SENDING;
+      uartTxCpltFlag = WAITING;
+      if (HAL_OK != HAL_UART_Transmit_IT(&huart9, (uint8_t *)uartTx, uartTx[0]))
+      {
+        appError = ERROR_CODE_21;
+        return RES_ERROR;
+      }
+      break;
+
+    case SENDING: //************ SEND RESPONSE *********************************
+      if (FINISHED == uartTxCpltFlag)  //TX interrupt triggered
+      {
+        if (RES_OK != BT_GetUartSt(&huart9, &uartSt)) // wait for hardware idle
+        {
+          appError = ERROR_CODE_22;
+          return RES_ERROR;
+        }
+        if (IDLE == uartSt)
+        {
+          if (HAL_OK != HAL_UARTEx_ReceiveToIdle_IT(&huart9, (uint8_t*)pUartRx, 
+                                           UART_CHUNK_SIZE))
+          {
+            appError = ERROR_CODE_23; // UART HW STATUS ERROR, 2MANY MSGs 
+            return RES_ERROR;
+          }
+          else uartFSM = IDLE; // Go to idle state
+        }
+      }
+      break;
+
+    default: // UNKNOWN FSM STATE
+      appError = ERROR_CODE_24;
+      return RES_ERROR;
+  }
+  return RES_OK;
+}
+
+// *****************************************************************************
+static tErrorCode CheckSysHealth(void)
+// *****************************************************************************
+// Description: Checks app variables to prevent reching limits. (CPU, Volume...)
+// Parameters: None.
+// Returns: Error code.
+// *****************************************************************************
+{
+  if (HEALTH_CHECK_PERIOD > healthCheckCounter) return RES_OK;
+  else if (HEALTH_CHECK_PERIOD < healthCheckCounter) return RES_ERROR;
+
+  cpuOverload = 0; //Reset CPU Overload flag
+  healthCheckCounter = 0; // Reset counter 
 
   return RES_OK;
 }

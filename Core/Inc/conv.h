@@ -27,10 +27,9 @@ void CONV_Test(int16_t *coeffs, uint16_t *size)
 // *****************************************************************************
 {
   uint16_t i;
-  *size = 2048;
+  *size = 7344; //MAX: 7400
   for (i = 0; i < *size; i++)
   {
     coeffs[i] = SHRT_MAX / *size;
   }
-
 }
